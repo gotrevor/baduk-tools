@@ -1,0 +1,263 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Check a registration list against the AGA rating list, before you pair.
+
+    go-roster check --csv registrations.csv     # both audits (the usual call)
+    go-roster ids   --csv registrations.csv     # is each AGA id the right person?
+    go-roster ranks --csv registrations.csv     # is each declared rank the book rank?
+    go-roster --sheet <id> --tab 'Form Responses 1' check
+
+The list needs columns whose headers CONTAIN "name", "aga" and "rank"
+(case-insensitive), so most form exports work untouched.  Everything else is
+ignored.
+
+Why bother: the AGA id is the key in the results file you send to
+ratings@usgo.org.  A mistyped one still resolves to a real member, passes every
+other check, and quietly attaches a player's games to a stranger.  `ids` grades
+each match and, for the bad ones, tells you which record it was probably meant
+to be.  `ranks` applies the truncation rule and reports the asks in rank steps.
+
+Weak-but-fine matches (a one-word form name, a given name written as an initial)
+are recorded in an acks file once you have eyeballed them, so the audit does not
+cry wolf every run - which is the failure mode that lets a real wrong id sit
+unnoticed.  Default `roster-acks.json` beside your tournament.toml; override with
+[roster] acks or --acks.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agaid
+import tdconfig
+
+
+# --- reading the registration list -------------------------------------------
+
+def read_csv_rows(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        return [row for row in csv.reader(fh) if any(c.strip() for c in row)]
+
+
+def read_sheet_rows(cfg, sheet_id, tab):
+    """Delegate to whatever Sheets reader the config names; expects TSV on stdout."""
+    cmd = cfg.sheets_cmd
+    if not cmd:
+        sys.exit("--sheet needs [sheets] cmd in tournament.toml (a command taking "
+                 "SHEET_ID and an A1 range, printing TSV); or export the sheet "
+                 "and use --csv")
+    proc = subprocess.run(cmd + [sheet_id, f"{tab}!A1:Z500"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"sheet read failed: {proc.stderr.strip()}")
+    return [line.split("\t") for line in proc.stdout.splitlines() if line.strip()]
+
+
+def find_columns(header):
+    """Locate name / AGA id / rank by substring, tolerating form-question wording."""
+    idx = {}
+    for i, h in enumerate(header):
+        h = h.strip().lower()
+        if "name" in h and "name" not in idx:
+            idx["name"] = i
+        elif "aga" in h and "aga" not in idx:
+            idx["aga"] = i
+        elif "rank" in h and "rank" not in idx:
+            idx["rank"] = i
+    missing = {"name", "aga", "rank"} - idx.keys()
+    if missing:
+        sys.exit(f"could not find column(s) {sorted(missing)} in header: {header}")
+    return idx
+
+
+def registrants(rows):
+    """[{name, aga_id, asked}] from a header row plus data rows."""
+    if not rows:
+        sys.exit("no rows in the registration list")
+    col = find_columns(rows[0])
+    width = max(col.values()) + 1
+    out = []
+    for row in rows[1:]:
+        row = list(row) + [""] * (width - len(row))
+        out.append({"name": row[col["name"]].strip(),
+                    "aga_id": row[col["aga"]].strip(),
+                    "asked": row[col["rank"]].strip()})
+    return out
+
+
+# --- acknowledged weak matches ------------------------------------------------
+
+def acks_path(cfg, override):
+    if override:
+        return Path(override).expanduser()
+    named = cfg.roster.get("acks")
+    return Path(named).expanduser() if named else cfg.source.parent / "roster-acks.json"
+
+
+def load_acks(path):
+    """{aga_id: why} - weak matches a human has already looked at and accepted."""
+    if not path.is_file():
+        return {}
+    try:
+        return {str(k): v for k, v in json.loads(path.read_text()).items()
+                if not str(k).startswith("_")}
+    except Exception as e:
+        print(f"⚠️  could not read {path}: {e}")
+        return {}
+
+
+# --- the identity audit -------------------------------------------------------
+
+def audit_ids(people, tdlist, acks, show_ok=False) -> int:
+    buckets: dict[str, list] = {}
+    for r in people:
+        grade, tdname, detail = agaid.grade_aga_id(r["name"], r["aga_id"], tdlist)
+        buckets.setdefault(grade, []).append((r, tdname, detail))
+
+    needs_look = 0
+    for grade, title in agaid.NEEDS_A_LOOK:
+        items = [x for x in buckets.get(grade, []) if x[0]["aga_id"] not in acks]
+        if not items:
+            continue
+        needs_look += len(items)
+        print(f"\n🚨 {title} ({len(items)}):")
+        for r, tdname, detail in items:
+            shown = f" -> AGA {r['aga_id']} is {tdname!r}" if tdname else f" -> id {r['aga_id']!r}"
+            print(f"   {r['name']!r}{shown}  [{detail}]")
+            print_suggestions(r, tdlist)
+
+    soft = [x for x in buckets.get(agaid.ONEWORD, []) if x[0]["aga_id"] not in acks]
+    if soft:
+        print(f"\nℹ️  Only half the name could be checked ({len(soft)}) - "
+              f"a one-word name, or a given name written as an initial:")
+        for r, tdname, _ in soft:
+            print(f"   {r['name']!r} -> AGA {r['aga_id']} is {tdname!r}")
+
+    noid = buckets.get(agaid.NO_ID, [])
+    if noid:
+        print(f"\n➖ No AGA id on the form ({len(noid)}): "
+              + ", ".join(r["name"] for r, _, _ in noid))
+
+    acked = [r for r in people if r["aga_id"] in acks]
+    if acked:
+        print(f"\n✓ {len(acked)} weak match(es) previously accepted: "
+              + ", ".join(r["name"] for r in acked))
+
+    full = buckets.get(agaid.FULL, [])
+    print(f"\n✅ {len(full)} of {len(people)} verified on BOTH surname and given name.")
+    if show_ok:
+        for r, tdname, _ in full:
+            print(f"   {r['name']:<24} {r['aga_id']:<7} = {tdname}")
+    return needs_look
+
+
+def print_suggestions(r, tdlist):
+    """The record a bad id was probably meant to be - the half people forget."""
+    cands = agaid.suggest_aga_id(r["name"], r["asked"], tdlist)
+    if not cands:
+        print("      no same-name record found in the rating list")
+        return
+    for aga_id, rec, gap in cands:
+        rating = (f"{rec['rating']:+.2f} ({agaid.rating_to_rank(rec['rating'])})"
+                  if rec.get("rating") is not None else "unrated")
+        bits = [f"rated {rating}"]
+        if gap == 0:
+            bits.append(f"MATCHES their requested {r['asked']}")
+        elif gap is not None and gap <= 2:
+            bits.append(f"{gap} stone off their requested {r['asked']}")
+        typo = agaid.digit_typo(r["aga_id"], aga_id)
+        if typo:
+            bits.append(typo)
+        for key in ("club", "state"):
+            if rec.get(key):
+                bits.append(rec[key])
+        print(f"      → try {aga_id}  {rec['name']!r}  ({', '.join(bits)})")
+
+
+# --- the rank audit -----------------------------------------------------------
+
+def audit_ranks(people, tdlist) -> int:
+    rated, unrated, promos, demos = [], [], [], []
+    for r in people:
+        rec = tdlist.get(r["aga_id"])
+        if not rec or rec.get("rating") is None:
+            if agaid.rank_to_stones(r["asked"]) is not None:
+                unrated.append(r)
+            continue
+        verdict, steps = agaid.grade_rank_ask(r["asked"], rec["rating"])
+        if verdict is None:
+            continue
+        row = (steps, r, rec, verdict)
+        rated.append(row)
+        if verdict in (agaid.AUTO_DENY, agaid.ADJUDICATE):
+            promos.append(row)
+        elif verdict == agaid.DENY_DOWN:
+            demos.append(row)
+
+    promos.sort(key=lambda t: (-t[0], -t[2]["rating"]))
+    demos.sort(key=lambda t: t[0])
+    print(f"\n{len(rated)} rated registrants | {len(promos)} promotion asks | "
+          f"{len(demos)} demotion asks | {len(unrated)} unrated")
+
+    if promos:
+        print(f"\n{'steps':>5}  {'name':<24} {'AGA':<7} {'book':<5} {'asks':<5} "
+              f"{'rating':>8}  last game     ruling")
+        print("-" * 96)
+        for steps, r, rec, verdict in promos:
+            ruling = ("ADJUDICATE (2+ steps) 🚩" if verdict == agaid.ADJUDICATE
+                      else "auto-deny (1 step)")
+            print(f"{steps:+5d}  {r['name']:<24} {r['aga_id']:<7} "
+                  f"{agaid.rating_to_rank(rec['rating']):<5} {r['asked']:<5} "
+                  f"{rec['rating']:>8.2f}  {rec['last_game']:<12}  {ruling}")
+
+    if demos:
+        print(f"\n{len(demos)} asking DOWN - a demotion is earned by losing games:")
+        for steps, r, rec, _ in demos:
+            print(f"{steps:+5d}  {r['name']:<24} {r['aga_id']:<7} "
+                  f"{agaid.rating_to_rank(rec['rating']):<5} {r['asked']:<5}")
+
+    if unrated:
+        print(f"\n{len(unrated)} with no AGA rating on file - resolve from their server "
+              f"rank (a common conversion: Fox/Tygem -2, Pandanet/EGF/CGA +1, "
+              f"Japanese club -1):")
+        for r in unrated:
+            print(f"       {r['name']:<24} {r['aga_id']:<7} asks {r['asked']}")
+
+    return len([p for p in promos if p[3] == agaid.ADJUDICATE])
+
+
+# --- CLI ----------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("what", choices=("check", "ids", "ranks"), nargs="?", default="check")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--csv", help="registration list as CSV")
+    src.add_argument("--sheet", help="Google Sheet id (needs [sheets] cmd)")
+    ap.add_argument("--tab", default="Form Responses 1", help="sheet tab name")
+    ap.add_argument("--acks", help="JSON of weak matches already accepted")
+    ap.add_argument("--show-ok", action="store_true", help="also list the clean matches")
+    tdconfig.add_config_arg(ap)
+    args = ap.parse_args()
+
+    cfg = tdconfig.load(args.config)
+    tdlist = agaid.load_tdlist(cfg.tdlist)
+    rows = read_csv_rows(args.csv) if args.csv else read_sheet_rows(cfg, args.sheet, args.tab)
+    people = registrants(rows)
+    print(f"{len(people)} registrants · rating list {cfg.tdlist} ({len(tdlist)} members)")
+
+    needs_look = 0
+    if args.what in ("check", "ids"):
+        needs_look += audit_ids(people, tdlist, load_acks(acks_path(cfg, args.acks)),
+                                show_ok=args.show_ok)
+    if args.what in ("check", "ranks"):
+        needs_look += audit_ranks(people, tdlist)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

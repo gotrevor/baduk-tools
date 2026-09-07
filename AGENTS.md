@@ -50,6 +50,22 @@ the value it checked.  **Fix every FAIL before telling the human you are done.**
 SKIP lines are optional features, not problems.  Then `bin/og-pairings -n` for a
 dry run that writes nothing.
 
+## Before the event: go-roster
+
+`go-roster check --csv <registrations>` is the pre-tournament pass.  Two things
+to understand before you touch it:
+
+- **A weak match is not an error.**  One-word form names, given names written as
+  an initial, married names and transliteration variants are normal on a real
+  roster.  The tool sorts them into buckets for a human; do not "fix" it by
+  tightening until the buckets are empty.
+- **The acks file is what keeps the report readable.**  When the TD confirms a
+  weak match, write it into the acks JSON with a note saying who confirmed it.
+  An audit that cries wolf every run stops being read, which is how a genuinely
+  wrong id survives.
+
+Run it again as registrations arrive; it is cheap and idempotent.
+
 ## Running an event
 
 Pair the round in OpenGotha → **File > Save** → `og-pairings --deploy` → enter

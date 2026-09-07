@@ -15,6 +15,11 @@ repo   = "~/src/wmgc"
 url    = "https://wmgc.massgo.org/ne-open-2026/"
 deploy = ["bin/deploy"]                     # run from `repo`; page paths appended
 
+[roster]
+# Weak name matches you have eyeballed and accepted, so go-roster stops asking.
+# Default: roster-acks.json beside this file.
+# acks = "roster-acks.json"
+
 [tdlist]
 path = "~/personal/data/aga/tdlist.tsv"
 

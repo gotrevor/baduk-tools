@@ -71,6 +71,7 @@ class Config:
         self._event = data.get("event", {})
         self._td = data.get("tdlist", {})
         self._sheets = data.get("sheets", {})
+        self.roster = data.get("roster", {})
 
     # --- OpenGotha ------------------------------------------------------------
     @property
