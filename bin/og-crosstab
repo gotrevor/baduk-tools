@@ -6,8 +6,9 @@
     og-crosstab --deploy        # build + push the page and index.md
     og-crosstab --verify        # diff our numbers against an OpenGotha export
 
-Unlike `og-standings` (which re-wraps OpenGotha's own Standings export and so
-needs a Publish click first), this computes MMS / SOS / SOSOS straight from
+Unlike OpenGotha's own Standings HTML export (which needs a Publish click and
+is styled for a desktop browser on the TD's laptop), this computes MMS/SOS/SOSOS
+straight from
 tournamentfiles/work/<tournament>.xml.  That means the page can go up mid-round and
 be refreshed as each result is entered - the same on-the-fly cross-tab we ran at
 MA State 2026.

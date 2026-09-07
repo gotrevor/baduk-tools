@@ -1,0 +1,121 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Check the setup: does every path in tournament.toml actually resolve?
+
+    og-doctor                 # diagnose
+    og-doctor --config X.toml # a specific config
+
+Every line is PASS / FAIL / SKIP with the value it checked, so the fix is
+obvious - and so an agent reading this output can act on it without guessing.
+Exits 1 if anything is broken.  Run it before round 1, not during.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+OK, BAD, MEH = "PASS", "FAIL", "SKIP"
+_rows: list[tuple[str, str, str]] = []
+
+
+def check(name: str, fn, optional=False):
+    """Run one probe.  A raised exception is a FAIL, never a traceback."""
+    try:
+        detail = fn()
+    except SystemExit as e:                      # tdconfig's own "missing key" exits
+        _rows.append((MEH if optional else BAD, name, str(e)))
+        return None
+    except Exception as e:
+        _rows.append((MEH if optional else BAD, name, f"{e.__class__.__name__}: {e}"))
+        return None
+    status, text = detail if isinstance(detail, tuple) else (OK, detail)
+    _rows.append((status, name, text))
+    return text
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    tdconfig.add_config_arg(ap)
+    args = ap.parse_args()
+
+    try:
+        cfg = tdconfig.load(args.config)
+    except SystemExit as e:
+        print(e)          # load() already carries the template + agent hint
+        return 1
+    print(f"config: {cfg.source}\n")
+
+    check("opengotha.home", lambda: (OK, str(cfg.og_home)) if cfg.og_home.is_dir()
+          else (BAD, f"{cfg.og_home} is not a directory - is OpenGotha installed there?"))
+    check("opengotha.tournament", lambda: str(cfg.newest_xml()))
+    check("export dir (og-crosstab --verify only)",
+          lambda: (OK, str(cfg.export_dir)) if cfg.export_dir.is_dir()
+          else (MEH, f"{cfg.export_dir} absent - only needed for --verify "
+                     "(OpenGotha: Publish > Standings > HTML)"), optional=True)
+    check("site.dir", lambda: (OK, str(cfg.site_dir)) if cfg.site_dir.is_dir()
+          else (BAD, f"{cfg.site_dir} does not exist - create it, pages are written there"))
+    check("site.repo", lambda: (OK, str(cfg.site_repo)) if cfg.site_repo.is_dir()
+          else (BAD, f"{cfg.site_repo} does not exist - --deploy runs from there"))
+    check("site.dir inside site.repo",
+          lambda: (OK, "yes") if str(cfg.site_dir).startswith(str(cfg.site_repo))
+          else (BAD, f"{cfg.site_dir} is not under {cfg.site_repo}; --deploy cannot "
+                     "name the pages it built"))
+    check("site.url", lambda: probe_url(cfg))
+    check("site.deploy", lambda: check_deploy(cfg))
+    check("event.title", lambda: cfg.event_title)
+    check("tdlist.path", lambda: tdlist(cfg), optional=True)
+    check("sheets.cmd (rank-audit --sheet only)",
+          lambda: (OK, " ".join(cfg.sheets_cmd)) if cfg.sheets_cmd
+          else (MEH, "unset - rank-audit --csv works without it"), optional=True)
+
+    width = max(len(n) for _, n, _ in _rows)
+    for status, name, text in _rows:
+        print(f"{status}  {name:<{width}}  {text}")
+
+    bad = [n for s, n, _ in _rows if s == BAD]
+    if bad:
+        print(f"\n{len(bad)} problem(s): {', '.join(bad)}")
+        print(tdconfig.AGENT_HINT)
+        return 1
+    print("\nready - try `og-pairings -n` for a no-write dry run")
+    return 0
+
+
+def probe_url(cfg):
+    url = cfg.page_url("")
+    if not url:
+        return (BAD, "[site] url unset - og-stale cannot check deployed pages")
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return (OK, f"{url} ({r.status})")
+    except Exception as e:
+        return (MEH, f"{url} not reachable yet ({e.__class__.__name__}) - fine before "
+                     "the first deploy")
+
+
+def check_deploy(cfg):
+    cmd = list(cfg._site.get("deploy") or ["bin/deploy"])
+    exe = cfg.site_repo / cmd[0]
+    shown = " ".join(cmd)
+    if Path(cmd[0]).is_absolute():
+        exe = Path(cmd[0])
+    if exe.exists():
+        return (OK, f"{shown}  (from {cfg.site_repo})")
+    return (BAD, f"{shown} - {exe} not found; --deploy would fail")
+
+
+def tdlist(cfg):
+    p = cfg.tdlist
+    if not p.is_file():
+        return (MEH, f"{p} absent - run `fetch-tdlist` (only aga-rank/rank-audit need it)")
+    rows = sum(1 for _ in p.open(encoding="utf-8", errors="replace"))
+    return (OK, f"{p} ({rows} rows)")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

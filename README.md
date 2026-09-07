@@ -19,7 +19,7 @@ can check pairings from the parking lot and a parent can follow along from home.
 |---|---|
 | `og-pairings` | Round pairings → a self-contained page.  Winners go green as results are entered, so a link posted at pairing time keeps working all round. |
 | `og-crosstab` | Cross-tab standings **computed live** from the tournament file — MMS / SOS / SOSOS, no Publish click, refreshable mid-round.  Reads the tournament's own `GeneralParameterSet`, so a parameter change in OpenGotha is picked up here.  `--verify` diffs our numbers against OpenGotha's own export as a known-answer control. |
-| `og-standings` | The simpler route: re-wrap OpenGotha's own Standings HTML export in readable, mobile-friendly page chrome. |
+| `og-doctor` | Does every path in your config actually resolve?  PASS / FAIL / SKIP per setting, with the value it checked.  Run it before round 1. |
 | `og-stale` | **The check you will forget.**  Every published page is a snapshot taken at deploy time; results entered afterwards are invisible until someone re-runs the publisher, and nothing else notices.  This compares each deployed page against the live XML and prints the exact redeploy command.  Exits 1 if anything is stale. |
 
 The usual rhythm: pair the round in OpenGotha → **save** → `og-pairings --deploy`
@@ -51,6 +51,17 @@ cd baduk-tools
 cp tournament.toml.example tournament.toml     # then edit it
 export PATH="$PWD/bin:$PATH"
 ```
+
+**Not sure what to put in it?  Hand the job to an agent.**  These tools assume you
+have a frontier model on hand, and [`AGENTS.md`](AGENTS.md) is written for one:
+
+```sh
+claude "read AGENTS.md and set up baduk-tools for my tournament"
+```
+
+It will find your OpenGotha installation and tournament file itself, ask you only
+about your website, write the config, and verify it with `og-doctor`.  Every
+failure message in this repo points back there.
 
 `tournament.toml` is the only configuration: which OpenGotha installation, which
 tournament file inside it, where built pages go, and how to push them.  It is

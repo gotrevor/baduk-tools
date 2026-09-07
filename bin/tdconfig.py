@@ -43,6 +43,16 @@ import sys
 import tomllib
 from pathlib import Path
 
+AGENT_HINT = """
+Stuck?  These tools are meant to be driven by an agent.  From the repo root:
+
+    claude "read AGENTS.md and set up baduk-tools for my tournament"
+    codex   "read AGENTS.md and set up baduk-tools for my tournament"
+
+AGENTS.md tells it how to find your OpenGotha install, write tournament.toml,
+and verify the result with `og-doctor`.
+"""
+
 CONFIG_NAME = "tournament.toml"
 USER_CONFIG = Path.home() / ".config" / "baduk-tools" / CONFIG_NAME
 
@@ -146,17 +156,34 @@ def add_config_arg(ap):
                     help=f"tournament.toml to use (default: ./{CONFIG_NAME} or {USER_CONFIG})")
 
 
+def _read(path: Path) -> Config:
+    with path.open("rb") as fh:
+        return Config(tomllib.load(fh), path)
+
+
 def load(explicit: str | None = None) -> Config:
+    # A config named OUT LOUD must exist.  Falling through to the next candidate
+    # would silently run somebody else's tournament, which is the one failure
+    # mode these tools must not have.
+    for named, where in ((explicit, "--config"),
+                         (os.environ.get("BADUK_TOURNAMENT_CONFIG"),
+                          "$BADUK_TOURNAMENT_CONFIG")):
+        if named:
+            path = Path(named).expanduser()
+            if not path.is_file():
+                sys.exit(f"{where} names {path}, which does not exist")
+            return _read(path)
+
     tried = []
-    for cand in (explicit, os.environ.get("BADUK_TOURNAMENT_CONFIG"),
-                 Path.cwd() / CONFIG_NAME, USER_CONFIG):
-        if not cand:
-            continue
+    for cand in (Path.cwd() / CONFIG_NAME, USER_CONFIG):
         path = Path(str(cand)).expanduser()
         tried.append(path)
         if path.is_file():
-            with path.open("rb") as fh:
-                return Config(tomllib.load(fh), path)
+            return _read(path)
+    here = Path(__file__).resolve().parent.parent
     sys.exit("no tournament config found; looked for\n  " +
              "\n  ".join(str(p) for p in tried) +
-             "\nCopy tournament.toml.example and fill it in.")
+             f"\n\nStart from the template:\n"
+             f"    cp {here / 'tournament.toml.example'} ./{CONFIG_NAME}\n"
+             f"then edit it and run `og-doctor` to check every path resolves.\n"
+             + AGENT_HINT)
