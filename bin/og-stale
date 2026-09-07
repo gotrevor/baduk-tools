@@ -1,0 +1,69 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Is any deployed pairings or cross-tab page stale?
+
+Every published page is a static snapshot of the OpenGotha XML at deploy time, so
+each result entered afterwards leaves the live page showing fewer winners than the
+file knows about - and nothing else notices.  Run this after every batch of result
+slips, and redeploy whatever it flags; it prints the exact command line.
+
+Exits 1 if anything is stale, so it also works as a gate.
+"""
+import argparse, re, sys, urllib.request, xml.etree.ElementTree as ET
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+PAGES = {"pairings": ("pairings-r{}.html", "og-pairings"),
+         "crosstab": ("crosstab-r{}.html", "og-crosstab")}
+
+
+def shown(kind: str, page: str) -> int:
+    """How many results does the deployed page already know about?"""
+    if kind == "pairings":
+        return len(re.findall(r"class='win'", page))
+    m = re.search(r"<strong>(\d+) of (\d+)</strong>", page)   # "N of M results in"
+    return int(m.group(1)) if m else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    tdconfig.add_config_arg(ap)
+    args = ap.parse_args()
+    cfg = tdconfig.load(args.config)
+
+    root = ET.parse(cfg.newest_xml()).getroot()
+    rounds = {}
+    for g in root.iter("Game"):
+        n = int(g.get("roundNumber"))
+        total, done = rounds.get(n, (0, 0))
+        rounds[n] = (total + 1, done + (g.get("result") != "RESULT_UNKNOWN"))
+
+    stale = []
+    for kind, (pattern, tool) in PAGES.items():
+        for n in sorted(rounds):
+            total, done = rounds[n]
+            url = cfg.page_url(pattern.format(n))
+            try:
+                page = urllib.request.urlopen(url, timeout=15).read().decode("utf-8", "replace")
+                live, state = shown(kind, page), None
+            except Exception as e:
+                live, state = None, ("not deployed" if "404" in str(e)
+                                     else f"unreachable ({e.__class__.__name__})")
+            if live is None:
+                print(f"{kind} r{n}: {done}/{total} entered  \u00b7  page {state}")
+                continue
+            flag = "STALE" if live != done else "ok"
+            if flag == "STALE":
+                stale.append((tool, n))
+            print(f"{kind} r{n}: {done}/{total} entered  \u00b7  page shows {live}  \u00b7  {flag}"
+                  + ("" if done == total else "   (round still in progress)"))
+
+    if stale:
+        print("\nredeploy: " + "; ".join(f"{tool} -r {n} --deploy" for tool, n in stale))
+    return 1 if stale else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""
+Analyze rating changes from an AGA tournament.
+
+Usage:
+    rating_changes.py <results.txt> <before.tsv> <after.tsv> [--csv output.csv]
+
+Takes:
+1. Tournament results file (AGA format with TOURNAMENT/PLAYERS/GAMES sections)
+2. TDList snapshot from before ratings update
+3. TDList snapshot from after ratings update
+
+Outputs a report showing:
+- Who improved the most (absolute rating points)
+- Who improved one rank or more
+- Who declined the most
+- Average change by rank band
+- Overall stats
+
+Options:
+    --csv FILE    Also output CSV for spreadsheet import
+"""
+
+import argparse
+import csv
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class Player:
+    aga_id: str
+    name: str
+    entry_rank: str  # Rank they entered with (from results file)
+
+
+@dataclass
+class GameResult:
+    white_id: str
+    black_id: str
+    winner_color: str  # 'b', 'w', or '?'
+    handicap: int
+    komi: int
+
+
+@dataclass
+class RatingChange:
+    player: Player
+    before: float | None  # Raw AGA rating, None if new player
+    after: float | None   # Raw AGA rating, None if not in after list
+    games_played: int = 0
+    wins: int = 0
+    losses: int = 0
+
+    @property
+    def is_new_player(self) -> bool:
+        return self.before is None
+
+    @property
+    def change(self) -> float | None:
+        """Normalized change (1 point = 1 rank, closes kyu/dan gap)."""
+        if self.before is None or self.after is None:
+            return None
+        return normalize_rating(self.after) - normalize_rating(self.before)
+
+    @property
+    def before_rank(self) -> str:
+        if self.before is None:
+            return "NEW"
+        return rating_to_rank(self.before)
+
+    @property
+    def after_rank(self) -> str:
+        if self.after is None:
+            return "?"
+        return rating_to_rank(self.after)
+
+    @property
+    def rank_changed(self) -> bool:
+        if self.before is None or self.after is None:
+            return False
+        return rating_to_rank(self.before) != rating_to_rank(self.after)
+
+    @property
+    def rank_band(self) -> str:
+        """Group into rank bands for stats. Uses after rating for new players."""
+        rating = self.before if self.before is not None else self.after
+        if rating is None:
+            return "Unknown"
+        if rating >= 5:
+            return "5d+"
+        elif rating >= 1:
+            return "1d-4d"
+        elif rating >= -5:
+            return "1k-5k"
+        elif rating >= -10:
+            return "6k-10k"
+        elif rating >= -20:
+            return "11k-20k"
+        else:
+            return "21k+"
+
+
+def rating_to_rank(rating: float) -> str:
+    """
+    Convert AGA rating to rank string.
+
+    AGA rating scale:
+    - Dan: 1d = 1.0-1.99, 2d = 2.0-2.99, etc.
+    - Kyu: 1k = -1.0 to -1.99, 2k = -2.0 to -2.99, etc.
+    - Gap: 0 to 0.99 and -0.01 to -0.99 are boundary zones
+    """
+    if rating >= 1.0:
+        return f"{int(rating)}d"
+    elif rating > 0:
+        return "1d"  # 0 < rating < 1: weak 1d
+    elif rating > -1.0:
+        return "1k"  # -0.99 to 0: strong 1k
+    else:
+        # -1.0 to -1.99 is 1k, -2.0 to -2.99 is 2k, etc.
+        kyu = int(-rating)
+        return f"{kyu}k"
+
+
+def normalize_rating(rating: float) -> float:
+    """
+    Normalize AGA rating to a continuous scale where 1 point = 1 rank.
+
+    AGA ratings have a 2-point gap at the kyu/dan boundary:
+    - 1k: -1.0 to -1.99 (midpoint ~ -1.5)
+    - 1d: 1.0 to 1.99 (midpoint ~ 1.5)
+    - Gap: -0.99 to 0.99 is a 2-point jump for ~1 rank
+
+    To make differences meaningful, shift dan ratings down by 2:
+    - 2d (2.5) → 0.5
+    - 1d (1.5) → -0.5
+    - 1k (-1.5) → -1.5 (unchanged)
+    - 2k (-2.5) → -2.5 (unchanged)
+
+    Now: mid 1k (-1.5) to mid 1d (1.5) = normalized (-1.5 to -0.5) = +1.0 ✓
+    """
+    if rating >= 1.0:
+        return rating - 2.0
+    return rating
+
+
+def rank_to_numeric(rank: str) -> int:
+    """Convert rank string to numeric for comparison (higher = stronger)."""
+    if rank.endswith('d'):
+        return int(rank[:-1]) + 30  # 1d=31, 7d=37
+    else:
+        return 30 - int(rank[:-1])  # 1k=29, 10k=20
+
+
+def parse_results_file(path: Path) -> tuple[list[Player], list[GameResult], str]:
+    """Parse AGA results file and extract player list, games, and tournament name."""
+    players = []
+    games = []
+    tournament_name = "Tournament"
+    in_players = False
+    in_games = False
+
+    with open(path) as f:
+        lines = f.readlines()
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+
+        # Tournament name is line after TOURNAMENT
+        if i > 0 and lines[i-1].strip() == "TOURNAMENT":
+            tournament_name = line
+            continue
+
+        if line == "PLAYERS":
+            in_players = True
+            in_games = False
+            continue
+        if line.startswith("GAMES"):
+            in_players = False
+            in_games = True
+            continue
+        if line == "END":
+            in_players = False
+            in_games = False
+            continue
+
+        if in_players and line:
+            # Format: AGA_ID  Name  Rank
+            parts = line.split()
+            if len(parts) >= 3:
+                aga_id = parts[0]
+                rank = parts[-1]
+                name = " ".join(parts[1:-1])
+                players.append(Player(aga_id=aga_id, name=name, entry_rank=rank))
+
+        if in_games and line:
+            # Format: white_id  black_id  winner_color  handicap  komi
+            parts = line.split()
+            if len(parts) >= 5:
+                games.append(GameResult(
+                    white_id=parts[0],
+                    black_id=parts[1],
+                    winner_color=parts[2].lower(),  # OpenGotha emits W/B uppercase
+                    handicap=int(parts[3]),
+                    komi=int(parts[4])
+                ))
+
+    return players, games, tournament_name
+
+
+def parse_tdlist(path: Path) -> dict[str, float]:
+    """Parse TDList TSV and return {aga_id: rating}."""
+    ratings = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 4:
+                aga_id = parts[1]  # Column B is AGA ID
+                try:
+                    rating = float(parts[3])  # Column D is rating
+                    ratings[aga_id] = rating
+                except (ValueError, IndexError):
+                    continue
+    return ratings
+
+
+def analyze_changes(
+    players: list[Player],
+    games: list[GameResult],
+    before: dict[str, float],
+    after: dict[str, float]
+) -> list[RatingChange]:
+    """Compare ratings for each player and calculate game stats."""
+    # Build player lookup
+    player_map = {p.aga_id: p for p in players}
+
+    # Count games and wins per player
+    games_played = defaultdict(int)
+    wins = defaultdict(int)
+    losses = defaultdict(int)
+
+    for game in games:
+        if game.winner_color == '?':
+            continue  # Skip unfinished games
+
+        games_played[game.white_id] += 1
+        games_played[game.black_id] += 1
+
+        if game.winner_color == 'w':
+            wins[game.white_id] += 1
+            losses[game.black_id] += 1
+        else:  # 'b'
+            wins[game.black_id] += 1
+            losses[game.white_id] += 1
+
+    changes = []
+    for player in players:
+        b = before.get(player.aga_id)  # None if new player
+        a = after.get(player.aga_id)   # None if not in after list
+        changes.append(RatingChange(
+            player=player,
+            before=b,
+            after=a,
+            games_played=games_played.get(player.aga_id, 0),
+            wins=wins.get(player.aga_id, 0),
+            losses=losses.get(player.aga_id, 0)
+        ))
+    return changes
+
+
+def find_upsets(games: list[GameResult], before: dict[str, float], players: list[Player]) -> list[tuple]:
+    """Find biggest upsets (lower-rated player beating higher-rated)."""
+    player_map = {p.aga_id: p for p in players}
+    upsets = []
+
+    for game in games:
+        if game.winner_color == '?':
+            continue
+        if game.white_id not in before or game.black_id not in before:
+            continue
+
+        white_rating = before[game.white_id]
+        black_rating = before[game.black_id]
+
+        # Determine winner and loser ratings
+        if game.winner_color == 'w':
+            winner_id, loser_id = game.white_id, game.black_id
+            winner_rating, loser_rating = white_rating, black_rating
+        else:
+            winner_id, loser_id = game.black_id, game.white_id
+            winner_rating, loser_rating = black_rating, white_rating
+
+        # Upset = winner was lower-rated (accounting for handicap)
+        # Handicap roughly equals rating difference, so subtract it
+        effective_diff = loser_rating - winner_rating - game.handicap
+
+        if effective_diff > 0:  # Winner was weaker
+            winner_name = player_map.get(winner_id, Player(winner_id, "Unknown", "?")).name
+            loser_name = player_map.get(loser_id, Player(loser_id, "Unknown", "?")).name
+            upsets.append((
+                effective_diff,
+                winner_name, rating_to_rank(winner_rating),
+                loser_name, rating_to_rank(loser_rating),
+                game.handicap
+            ))
+
+    return sorted(upsets, key=lambda x: x[0], reverse=True)
+
+
+def format_rating(rating: float) -> str:
+    """Format rating with sign."""
+    return f"{rating:+.2f}" if rating != 0 else "0.00"
+
+
+def print_report(changes: list[RatingChange], games: list[GameResult],
+                 before: dict[str, float], players: list[Player],
+                 tournament_name: str = "Tournament"):
+    """Print the analysis report."""
+    if not changes:
+        print("No rating changes found!")
+        return
+
+    # Separate new players from returning players
+    returning = [c for c in changes if c.change is not None]
+    new_players = [c for c in changes if c.is_new_player and c.after is not None]
+
+    # Sort returning players by change (descending)
+    by_improvement = sorted(returning, key=lambda c: c.change, reverse=True)
+
+    # Stats (only for returning players with valid changes)
+    improved = [c for c in returning if c.change > 0]
+    declined = [c for c in returning if c.change < 0]
+    unchanged = [c for c in returning if c.change == 0]
+    rank_up = [c for c in returning if c.rank_changed and c.change > 0]
+    rank_down = [c for c in returning if c.rank_changed and c.change < 0]
+
+    print(f"📊 Rating Changes Report")
+    print(f"{'=' * 60}")
+    print(f"Tournament: {tournament_name}")
+    print(f"Returning players: {len(returning)}")
+    print(f"New players: {len(new_players)}")
+    print(f"Total games: {len([g for g in games if g.winner_color != '?'])}")
+    print()
+
+    # Summary stats
+    print(f"📈 Summary (returning players)")
+    if returning:
+        print(f"   Improved: {len(improved)} ({100*len(improved)/len(returning):.0f}%)")
+        print(f"   Declined: {len(declined)} ({100*len(declined)/len(returning):.0f}%)")
+        print(f"   Unchanged: {len(unchanged)} ({100*len(unchanged)/len(returning):.0f}%)")
+        print(f"   Rank up: {len(rank_up)}")
+        print(f"   Rank down: {len(rank_down)}")
+    print()
+
+    if improved:
+        avg_gain = sum(c.change for c in improved) / len(improved)
+        print(f"   Avg gain (improved only): {format_rating(avg_gain)}")
+    if declined:
+        avg_loss = sum(c.change for c in declined) / len(declined)
+        print(f"   Avg loss (declined only): {format_rating(avg_loss)}")
+    print()
+
+    # Average change by rank band (returning players only)
+    print(f"📊 Average Change by Rank Band")
+    bands = defaultdict(list)
+    for c in returning:
+        if c.change is not None:
+            bands[c.rank_band].append(c.change)
+
+    band_order = ["5d+", "1d-4d", "1k-5k", "6k-10k", "11k-20k", "21k+"]
+    for band in band_order:
+        if band in bands:
+            avg = sum(bands[band]) / len(bands[band])
+            print(f"   {band:<10} {format_rating(avg):>8} (n={len(bands[band])})")
+    print()
+
+    # Top improvers
+    print(f"🏆 Top 10 Improvers")
+    print(f"   {'Name':<28} {'W-L':>5} {'Before':>8} {'After':>8} {'Change':>8}")
+    print(f"   {'-'*28} {'-'*5} {'-'*8} {'-'*8} {'-'*8}")
+    for c in by_improvement[:10]:
+        if c.change > 0:
+            wl = f"{c.wins}-{c.losses}"
+            print(f"   {c.player.name:<28} {wl:>5} {c.before:>8.2f} {c.after:>8.2f} {format_rating(c.change):>8}")
+    print()
+
+    # Rank promotions
+    if rank_up:
+        print(f"⬆️  Rank Promotions ({len(rank_up)})")
+        print(f"   {'Name':<28} {'From':>6} {'To':>6} {'Change':>8}")
+        print(f"   {'-'*28} {'-'*6} {'-'*6} {'-'*8}")
+        for c in sorted(rank_up, key=lambda c: c.change, reverse=True):
+            print(f"   {c.player.name:<28} {c.before_rank:>6} {c.after_rank:>6} {format_rating(c.change):>8}")
+        print()
+
+    # Biggest upsets
+    upsets = find_upsets(games, before, players)
+    if upsets:
+        print(f"😱 Biggest Upsets (top 5)")
+        print(f"   {'Winner':<20} {'Rank':>5}  beat  {'Loser':<20} {'Rank':>5} {'Hcap':>4}")
+        print(f"   {'-'*20} {'-'*5}        {'-'*20} {'-'*5} {'-'*4}")
+        for diff, winner, w_rank, loser, l_rank, hcap in upsets[:5]:
+            hcap_str = f"H{hcap}" if hcap > 0 else "even"
+            print(f"   {winner:<20} {w_rank:>5}  beat  {loser:<20} {l_rank:>5} {hcap_str:>4}")
+        print()
+
+    # Biggest declines
+    if declined:
+        print(f"📉 Biggest Declines (top 5)")
+        print(f"   {'Name':<28} {'W-L':>5} {'Before':>8} {'After':>8} {'Change':>8}")
+        print(f"   {'-'*28} {'-'*5} {'-'*8} {'-'*8} {'-'*8}")
+        for c in by_improvement[-5:]:
+            if c.change < 0:
+                wl = f"{c.wins}-{c.losses}"
+                print(f"   {c.player.name:<28} {wl:>5} {c.before:>8.2f} {c.after:>8.2f} {format_rating(c.change):>8}")
+        print()
+
+    # Rank demotions
+    if rank_down:
+        print(f"⬇️  Rank Demotions ({len(rank_down)})")
+        print(f"   {'Name':<28} {'From':>6} {'To':>6} {'Change':>8}")
+        print(f"   {'-'*28} {'-'*6} {'-'*6} {'-'*8}")
+        for c in sorted(rank_down, key=lambda c: c.change):
+            print(f"   {c.player.name:<28} {c.before_rank:>6} {c.after_rank:>6} {format_rating(c.change):>8}")
+        print()
+
+    # New players
+    if new_players:
+        print(f"🆕 New Players ({len(new_players)})")
+        print(f"   {'Name':<28} {'W-L':>5} {'Entry':>6} {'Rating':>8} {'Rank':>6}")
+        print(f"   {'-'*28} {'-'*5} {'-'*6} {'-'*8} {'-'*6}")
+        for c in sorted(new_players, key=lambda c: c.after or 0, reverse=True):
+            wl = f"{c.wins}-{c.losses}"
+            rating_str = f"{c.after:.2f}" if c.after else "?"
+            print(f"   {c.player.name:<28} {wl:>5} {c.player.entry_rank:>6} {rating_str:>8} {c.after_rank:>6}")
+
+
+def write_csv(changes: list[RatingChange], path: Path, tournament_name: str):
+    """Write changes to CSV for spreadsheet import."""
+    # Sort: returning players by change (desc), then new players by rating (desc)
+    returning = [c for c in changes if c.change is not None]
+    new_players = [c for c in changes if c.is_new_player and c.after is not None]
+
+    sorted_changes = (
+        sorted(returning, key=lambda c: c.change, reverse=True) +
+        sorted(new_players, key=lambda c: c.after or 0, reverse=True)
+    )
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'AGA ID', 'Name', 'Entry Rank', 'Games', 'Wins', 'Losses',
+            'Rating Before', 'Rating After', 'Change',
+            'Rank Before', 'Rank After', 'Rank Changed', 'Rank Band', 'New Player'
+        ])
+        for c in sorted_changes:
+            writer.writerow([
+                c.player.aga_id,
+                c.player.name,
+                c.player.entry_rank,
+                c.games_played,
+                c.wins,
+                c.losses,
+                f"{c.before:.2f}" if c.before is not None else "",
+                f"{c.after:.2f}" if c.after is not None else "",
+                f"{c.change:+.2f}" if c.change is not None else "",
+                c.before_rank,
+                c.after_rank,
+                "Yes" if c.rank_changed else "No",
+                c.rank_band,
+                "Yes" if c.is_new_player else "No"
+            ])
+    print(f"📄 CSV written to: {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze rating changes from AGA tournament")
+    parser.add_argument("results", type=Path, help="Tournament results file (AGA format)")
+    parser.add_argument("before", type=Path, help="TDList before ratings update")
+    parser.add_argument("after", type=Path, help="TDList after ratings update")
+    parser.add_argument("--csv", type=Path, help="Output CSV file for spreadsheet import")
+    args = parser.parse_args()
+
+    # Validate files exist
+    for p in [args.results, args.before, args.after]:
+        if not p.exists():
+            print(f"❌ File not found: {p}", file=sys.stderr)
+            sys.exit(1)
+
+    # Parse data
+    players, games, tournament_name = parse_results_file(args.results)
+    before = parse_tdlist(args.before)
+    after = parse_tdlist(args.after)
+
+    # Analyze
+    changes = analyze_changes(players, games, before, after)
+
+    # Report
+    print_report(changes, games, before, players, tournament_name)
+
+    # CSV output
+    if args.csv:
+        write_csv(changes, args.csv, tournament_name)
+
+
+if __name__ == "__main__":
+    main()

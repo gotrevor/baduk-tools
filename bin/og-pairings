@@ -1,0 +1,251 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Publish round pairings from the live OpenGotha tournament file.
+
+    og-pairings             # newest round found in the XML -> local page
+    og-pairings -r 2        # a specific round
+    og-pairings --deploy    # build + push the round page and index.md
+
+Reads the tournament OpenGotha is actually running (tournamentfiles/work), writes
+<site.dir>/pairings-rN.html, and keeps a link row at the top of index.md between
+the PAIRINGS markers so the *main page* stays the stable URL to hand out.
+
+Paths, event name and deploy command come from tournament.toml - see tdconfig.py.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import re
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+CFG = None      # a tdconfig.Config, set in main() from tournament.toml
+
+
+MARK_BEGIN = "<!-- PAIRINGS:BEGIN -->"
+MARK_END = "<!-- PAIRINGS:END -->"
+
+
+def key(name: str, first: str) -> str:
+    return re.sub(r"[^A-Z0-9-]", "", (name + first).upper())
+
+
+def rank_of(p) -> str:
+    return (p.get("rank") or "").strip().replace("D", "d").replace("K", "k")
+
+
+def load(path: Path):
+    root = ET.parse(path).getroot()
+    players = {key(p.get("name", ""), p.get("firstName", "")): p for p in root.find("Players")}
+    games = [g.attrib for g in root.find("Games")]
+    gps = root.find("TournamentParameterSet").find("GeneralParameterSet")
+    saved = root.get("saveDT", "")
+    return players, games, gps, saved
+
+
+def player_cell(players, k: str, won: bool = False) -> str:
+    p = players.get(k)
+    if p is None:                       # unknown key: show the raw id rather than lie
+        return html.escape(k)
+    tick = "<span class='ck'>&#10003;</span> " if won else ""
+    name = f"{p.get('firstName', '').strip()} {p.get('name', '').strip()}".strip()
+    club = (p.get("club") or "").strip()
+    if club.upper() in ("NOCB", "NONE", "-"):      # OpenGotha's "no club" placeholder
+        club = ""
+    bits = [f"{tick}<span class='pn'>{html.escape(name)}</span>",
+            f"<span class='pr'>{html.escape(rank_of(p))}</span>"]
+    if club:
+        bits.append(f"<span class='pc'>{html.escape(club)}</span>")
+    return " ".join(bits)
+
+
+def build_page(players, games, gps, saved: str, rnd: int) -> str:
+    rows = sorted((g for g in games if int(g["roundNumber"]) == rnd),
+                  key=lambda g: int(g["tableNumber"]))
+    if not rows:
+        sys.exit(f"no round-{rnd} games in the tournament file")
+    paired = {k for g in rows for k in (g["blackPlayer"], g["whitePlayer"])}
+    sitting = sorted(
+        (p for k, p in players.items()
+         if p.get("participating", "")[rnd - 1:rnd] == "1" and k not in paired),
+        key=lambda p: (p.get("name", ""), p.get("firstName", "")))
+
+    when = "unknown"
+    if len(saved) == 14:
+        when = datetime.strptime(saved, "%Y%m%d%H%M%S").strftime("%A %-I:%M %p")
+    komi = (gps.get("komi") or "").rstrip("0").rstrip(".")
+
+    def winner(g) -> str:
+        res = g.get("result", "")
+        if "WHITEWINS" in res:
+            return "w"
+        if "BLACKWINS" in res:
+            return "b"
+        return ""
+
+    done = sum(1 for g in rows if winner(g))
+    tr = []
+    for g in rows:
+        hd = int(g["handicap"])
+        hcp = "even" if hd == 0 else f"H{hd}"
+        win = winner(g)
+        byd = "BYDEF" in g.get("result", "")
+        tr.append(
+            f"<tr><td class='tbl'>{int(g['tableNumber'])}"
+            f"{'' if hd == 0 else f'<span class=hb>H{hd}</span>'}</td>"
+            f"<td class='{'win' if win == 'w' else ''}'>"
+            f"{player_cell(players, g['whitePlayer'], win == 'w')}</td>"
+            f"<td class='{'win' if win == 'b' else ''}'>"
+            f"{player_cell(players, g['blackPlayer'], win == 'b')}</td>"
+            f"<td class='hcp{'' if hd == 0 else ' h'}'>{hcp}"
+            f"{' <span class=bd>forfeit</span>' if byd else ''}</td></tr>")
+
+    extra = ""
+    if sitting:
+        names = ", ".join(html.escape(f"{p.get('firstName','').strip()} {p.get('name','').strip()}".strip())
+                          for p in sitting)
+        extra = f"<p class='note'><strong>Not paired this round:</strong> {names}</p>"
+
+    title_tail = " Pairings" if not done else (
+        " Results" if done == len(rows) else " Pairings &amp; Results")
+    progress = "" if not done else (
+        f" &middot; <strong>{done} of {len(rows)}</strong> results in")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{CFG.event_title} - Round {rnd} Pairings</title>
+<style>
+  body {{ max-width: 760px; margin: 24px auto; padding: 0 16px; color: #333;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }}
+  h1 {{ font-size: 1.5em; margin: 0 0 .15em; }}
+  a {{ color: #0066cc; }}
+  .sub {{ color: #555; margin: 0 0 1em; font-size: .95em; }}
+  .rounds {{ margin: 0 0 1em; font-size: .95em; }}
+  .rounds a, .rounds span {{ display: inline-block; padding: 4px 10px; margin: 2px 4px 2px 0;
+         border: 1px solid #bbb; border-radius: 4px; text-decoration: none; }}
+  .rounds .now {{ background: #1a4d80; border-color: #1a4d80; color: #fff; font-weight: bold; }}
+  #q {{ width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 1em;
+        border: 1px solid #bbb; border-radius: 4px; margin-bottom: 12px; }}
+  table {{ border-collapse: collapse; width: 100%; table-layout: fixed; }}
+  th:first-child, td.tbl {{ width: 3.4em; }}
+  th:last-child {{ width: 4.5em; }}
+  td {{ overflow-wrap: break-word; }}
+  th, td {{ padding: 7px 9px; border: 1px solid #ddd; text-align: left; vertical-align: top; }}
+  th {{ background: #f4f4f4; white-space: nowrap; }}
+  tr:nth-child(even) td {{ background: #fafafa; }}
+  td.tbl {{ text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; width: 3em; }}
+  td.hcp {{ white-space: nowrap; color: #777; }}
+  td.hcp.h {{ color: #8a4b00; font-weight: bold; }}
+  .pn {{ font-weight: 600; }}
+  td.win {{ background: #e6f4ea !important; }}
+  .ck {{ color: #1e6b34; font-weight: bold; }}
+  .bd {{ color: #a10000; font-size: .85em; }}
+  .pr {{ color: #1a4d80; font-variant-numeric: tabular-nums; }}
+  .pc {{ color: #888; font-size: .88em; }}
+  .note {{ font-size: .9em; color: #555; }}
+  .hb {{ display: none; color: #8a4b00; font-size: .8em; }}
+  @media (max-width: 560px) {{
+    body {{ margin: 12px auto; font-size: .95em; }}
+    th, td {{ padding: 6px 5px; }}
+    .pc {{ display: none; }}
+    th:nth-child(4), td:nth-child(4) {{ display: none; }}
+    .hb {{ display: block; }}
+  }}
+</style>
+</head>
+<body>
+<h1>Round {rnd}{title_tail}</h1>
+<p class="sub">{CFG.event_subtitle} &middot;
+posted {html.escape(when)}{progress} &middot; <a href="./">tournament page</a></p>
+<input id="q" type="search" placeholder="Type a name, club or table number to filter"
+       autocomplete="off" aria-label="Filter pairings">
+<table id="p">
+<thead><tr><th>Table</th><th>White</th><th>Black</th><th>Hcp</th></tr></thead>
+<tbody>
+{chr(10).join(tr)}
+</tbody>
+</table>
+{extra}
+<p class="note">{len(rows)} games. A green row half with &#10003; is the winner.
+Even games: komi {komi}.
+&quot;H<em>n</em>&quot; means an <em>n</em>-stone handicap - ask the TD if you are unsure.</p>
+<script>
+document.getElementById('q').addEventListener('input', function () {{
+  var s = this.value.trim().toLowerCase();
+  document.querySelectorAll('#p tbody tr').forEach(function (row) {{
+    row.style.display = !s || row.textContent.toLowerCase().indexOf(s) > -1 ? '' : 'none';
+  }});
+}});
+</script>
+</body>
+</html>
+"""
+
+
+def link_block(rounds: list[int]) -> str:
+    links = " &middot; ".join(
+        f'<a href="pairings-r{r}.html">Round {r}</a>' for r in rounds)
+    return (f'{MARK_BEGIN}\n'
+            f'<p style="border:2px solid #1a4d80;border-radius:6px;padding:10px 14px;'
+            f'font-size:1.05em"><strong>Pairings:</strong> {links}</p>\n'
+            f'{MARK_END}')
+
+
+def update_index(rounds: list[int]) -> None:
+    text = CFG.index_md.read_text()
+    block = link_block(rounds)
+    if MARK_BEGIN in text and MARK_END in text:
+        new = re.sub(re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END),
+                     lambda _: block, text, flags=re.S)
+    else:                                # insert right under the H1
+        lines = text.split("\n")
+        i = next(n for n, ln in enumerate(lines) if ln.startswith("# ")) + 1
+        new = "\n".join(lines[:i] + ["", block] + lines[i:])
+    if new != text:
+        CFG.index_md.write_text(new)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Publish round pairings from OpenGotha.")
+    tdconfig.add_config_arg(ap)
+    ap.add_argument("-r", "--round", type=int, help="round number (default: newest paired)")
+    ap.add_argument("--deploy", action="store_true", help="build, then run the site deploy command")
+    ap.add_argument("--dry-run", "-n", action="store_true", help="report only; write nothing")
+    args = ap.parse_args()
+
+    global CFG
+    CFG = tdconfig.load(args.config)
+
+    xml = CFG.newest_xml()
+    players, games, gps, saved = load(xml)
+    have = sorted({int(g["roundNumber"]) for g in games})
+    rnd = args.round or (have[-1] if have else 0)
+    if rnd not in have:
+        sys.exit(f"round {rnd} not paired yet (file has: {have or 'none'})")
+
+    page = build_page(players, games, gps, saved, rnd)
+    out = CFG.site_dir / f"pairings-r{rnd}.html"
+    print(f"source: {xml}  (saved {saved})")
+    print(f"round {rnd}: {sum(1 for g in games if int(g['roundNumber']) == rnd)} games -> {out}")
+    if args.dry_run:
+        return 0
+    out.write_text(page)
+    update_index(have)
+
+    if args.deploy:
+        rc = CFG.deploy([out, CFG.index_md])
+        if rc:
+            return rc
+        print(f"live: {CFG.page_url(out.name)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

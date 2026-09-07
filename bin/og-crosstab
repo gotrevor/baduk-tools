@@ -1,0 +1,503 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Publish the cross-tab standings, computed live from the OpenGotha tournament file.
+
+    og-crosstab                 # newest round with results -> local page
+    og-crosstab -r 2            # a specific round
+    og-crosstab --deploy        # build + push the page and index.md
+    og-crosstab --verify        # diff our numbers against an OpenGotha export
+
+Unlike `og-standings` (which re-wraps OpenGotha's own Standings export and so
+needs a Publish click first), this computes MMS / SOS / SOSOS straight from
+tournamentfiles/work/<tournament>.xml.  That means the page can go up mid-round and
+be refreshed as each result is entered - the same on-the-fly cross-tab we ran at
+MA State 2026.
+
+Scoring follows the tournament's own GeneralParameterSet (MM bar, floor, zero,
+bye and absent values), so a parameter change in OpenGotha is picked up here.
+`--verify` is the known-answer control: it re-reads OpenGotha's exported
+StandingsRN.html and reports any row where we disagree.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import re
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+CFG = None      # a tdconfig.Config, set in main() from tournament.toml
+
+
+MARK_BEGIN = "<!-- CROSSTAB:BEGIN -->"
+MARK_END = "<!-- CROSSTAB:END -->"
+
+
+# --------------------------------------------------------------- tournament model
+
+def key(name: str, first: str) -> str:
+    return re.sub(r"[^A-Z0-9-]", "", (name + first).upper())
+
+
+def rank_value(rank: str) -> int:
+    """OpenGotha's McMahon scale: 30K = 0, 1K = 29, 1D = 30, 9D = 38."""
+    m = re.match(r"\s*(\d+)\s*([DKdk])", rank or "")
+    if not m:
+        return 0
+    n, letter = int(m.group(1)), m.group(2).upper()
+    return 29 + n if letter == "D" else 30 - n
+
+
+class P:
+    def __init__(self, el, gps):
+        self.el = el
+        self.k = key(el.get("name", ""), el.get("firstName", ""))
+        self.name = f"{el.get('name','').strip()} {el.get('firstName','').strip()}".strip()
+        self.rank = (el.get("rank") or "").strip()
+        self.club = (el.get("club") or "").strip()
+        self.country = (el.get("country") or "").strip()
+        self.rating = float(el.get("rating") or 0)
+        self.participating = el.get("participating", "")
+        bar, floor = rank_value(gps.get("genMMBar", "5D")), rank_value(gps.get("genMMFloor", "30K"))
+        zero = rank_value(gps.get("genMMZero", "30K"))
+        v = min(max(rank_value(self.rank), floor), bar) - zero
+        self.smms = v + int(el.get("smmsCorrection") or 0)
+        self.games = {}          # round -> dict(opp, color, res, hd) ; res in +-?
+        self.bye = set()         # rounds taken as a bye
+        self.mms = float(self.smms)
+        self.nbw = 0.0
+        self.sos = self.sosos = 0.0
+        self.num = 0
+        self.place = 0
+
+    def plays(self, rnd: int) -> bool:
+        return self.participating[rnd - 1:rnd] == "1"
+
+
+def load(path: Path):
+    root = ET.parse(path).getroot()
+    gps = root.find("TournamentParameterSet").find("GeneralParameterSet")
+    players = {}
+    for el in root.find("Players"):
+        p = P(el, gps)
+        players[p.k] = p
+    games = [g.attrib for g in root.find("Games")]
+    return players, games, gps, root.get("saveDT", "")
+
+
+def score(players: dict, games: list, gps, rnd: int) -> list:
+    """Fill MMS / NbW / SOS / SOSOS through round `rnd`; return the sorted table."""
+    mms_bye = float(gps.get("genMMS2ValueBye", 2)) / 2
+    mms_abs = float(gps.get("genMMS2ValueAbsent", 1)) / 2
+    nbw_bye = float(gps.get("genNBW2ValueBye", 2)) / 2
+    nbw_abs = float(gps.get("genNBW2ValueAbsent", 0)) / 2
+    round_down = (gps.get("genRoundDownNBWMMS", "true") == "true")
+
+    for g in games:
+        r = int(g["roundNumber"])
+        if r > rnd:
+            continue
+        w, b = players.get(g["whitePlayer"]), players.get(g["blackPlayer"])
+        res, hd = g.get("result", ""), int(g.get("handicap", 0))
+        for me, opp, color in ((w, b, "w"), (b, w, "b")):
+            if me is None or opp is None:
+                continue
+            mark = "?" if "UNKNOWN" in res else (
+                "+" if (color == "w") == ("WHITEWINS" in res) else "-")
+            me.games[r] = dict(opp=opp, color=color, hd=hd, res=mark,
+                               bydef="BYDEF" in res)
+
+    # byes: participating, but in no game that round
+    for r in range(1, rnd + 1):
+        for p in players.values():
+            if p.plays(r) and r not in p.games:
+                p.bye.add(r)
+
+    for p in players.values():
+        p.mms = float(p.smms)
+        p.nbw = 0.0
+        for r in range(1, rnd + 1):
+            if r in p.bye:
+                p.mms += mms_bye
+                p.nbw += nbw_bye
+            elif r not in p.games:                       # registered but sitting out
+                p.mms += mms_abs
+                p.nbw += nbw_abs
+            elif p.games[r]["res"] == "+":
+                p.mms += 1
+                p.nbw += 1
+        if round_down:
+            p.mms, p.nbw = float(int(p.mms)), float(int(p.nbw))
+
+    # SOS/SOSOS.  Two conventions, both read off OpenGotha's own export:
+    #  - a handicap game counts the opponent at MMS +hd for White (who gave the
+    #    stones) and -hd for Black, i.e. the handicap notionally levels the pair;
+    #  - a round without a real opponent scores against a virtual opponent
+    #    holding the player's own MMS.
+    for p in players.values():
+        p.sos = sum(opp_score(p, r) if r in p.games else p.mms
+                    for r in range(1, rnd + 1))
+    #    A virtual opponent's own SOS is `rnd * my MMS` - it is taken to have met
+    #    opponents at my score in every round - NOT my own SOS.  The two differ
+    #    whenever my real opponents are not all at my MMS, which is why only
+    #    players with an unplayed round were ever wrong here.
+    for p in players.values():
+        p.sosos = sum(p.games[r]["opp"].sos if r in p.games else rnd * p.mms
+                      for r in range(1, rnd + 1))
+
+    table = [p for p in players.values()
+             if any(p.plays(r) for r in range(1, rnd + 1))]
+    table.sort(key=lambda p: (-p.mms, -p.sos, -p.sosos, p.name))
+    place, prev = 0, None
+    for i, p in enumerate(table, 1):
+        p.num = i
+        cur = (p.mms, p.sos, p.sosos)
+        if cur != prev:
+            place, prev = i, cur
+        p.place = place
+    return table
+
+
+def opp_score(p: P, r: int) -> float:
+    g = p.games[r]
+    return g["opp"].mms + (g["hd"] if g["color"] == "w" else -g["hd"])
+
+
+def cell(p: P, r: int) -> str:
+    if r in p.bye:
+        return "bye"
+    g = p.games.get(r)
+    if g is None:
+        return "&ndash;"
+    txt = f"{g['opp'].num}{g['res']}/{g['color']}{g['hd']}"
+    if g["res"] == "+":
+        txt = f"<b>{txt}</b>"
+    elif g["res"] == "?":
+        txt = f"<span class='pend'>{txt}</span>"
+    if g["bydef"]:
+        txt += "<span class='bd'>&nbsp;def</span>"
+    return txt
+
+
+def num(x: float) -> str:
+    return str(int(x)) if x == int(x) else f"{x:g}"
+
+
+# --------------------------------------------------------------- page
+
+def build_page(table: list, gps, saved: str, rnd: int, games: list) -> str:
+    when = "unknown"
+    if len(saved) == 14:
+        when = datetime.strptime(saved, "%Y%m%d%H%M%S").strftime("%A %-I:%M %p")
+    this = [g for g in games if int(g["roundNumber"]) == rnd]
+    done = sum(1 for g in this if "UNKNOWN" not in g.get("result", ""))
+    progress = (f" &middot; <strong>{done} of {len(this)}</strong> round-{rnd} results in"
+                if this else "")
+    nav = " ".join((f'<span class="now">Round {r}</span>' if r == rnd
+                    else f'<a href="crosstab-r{r}.html">Round {r}</a>')
+                   for r in range(1, max(int(g["roundNumber"]) for g in games) + 1))
+    heads = "".join(f"<th>R{r}</th>" for r in range(1, rnd + 1))
+    mms_col = 6 + rnd            # Num Pl Name Rank Club NbW then one col per round
+    sos_col, sosos_col = mms_col + 1, mms_col + 2
+    rows = []
+    for p in table:
+        round_cells = [cell(p, r) for r in range(1, rnd + 1)]
+        cells = "".join(f"<td class='g'>{c}</td>" for c in round_cells)
+        # Two search tiers.  Substring matching is for text a typist half-remembers -
+        # a name, a club, a rank.  Everything numeric matches only as a whole value,
+        # because a digit is a substring of half the table: "4" must find player 4
+        # and a SOSOS of 4, never player 14 or a SOSOS of 314.
+        q = " ".join([p.name, p.rank, p.club]).lower()
+        opps = [m.group(1) for m in
+                (re.match(r"(\d+)", re.sub(r"<[^>]+>", "", c)) for c in round_cells) if m]
+        x = " ".join([str(p.num), str(p.place)]
+                     + [num(v) for v in (p.nbw, p.mms, p.sos, p.sosos)] + opps)
+        # data-v is what a column sorts on when the rendered text will not do:
+        # rank needs its McMahon value (7D above 1K), and Pl is blank on tied rows.
+        rows.append(
+            f"<tr data-q=\"{html.escape(q.lower(), quote=True)}\" "
+            f"data-x=\"{html.escape(x, quote=True)}\">"
+            f"<td class='n'>{p.num}</td>"
+            f"<td class='n' data-v='{p.place}'>{p.place if p.num == p.place else ''}</td>"
+            f"<td class='pn'>{html.escape(p.name)}</td>"
+            f"<td class='pr' data-v='{rank_value(p.rank)}'>{html.escape(p.rank)}</td>"
+            f"<td class='pc'>{html.escape(p.club)}</td>"
+            f"<td class='n'>{num(p.nbw)}</td>{cells}"
+            f"<td class='n'>{num(p.mms)}</td><td class='n s'>{num(p.sos)}</td>"
+            f"<td class='n s'>{num(p.sosos)}</td></tr>")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{CFG.event_title} - Round {rnd} Cross-tab</title>
+<style>
+  body {{ max-width: 1000px; margin: 24px auto; padding: 0 16px; color: #333;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }}
+  h1 {{ font-size: 1.5em; margin: 0 0 .15em; }}
+  a {{ color: #0066cc; }}
+  .sub {{ color: #555; margin: 0 0 1em; font-size: .95em; }}
+  .rounds {{ margin: 0 0 1em; font-size: .95em; }}
+  .rounds a, .rounds span {{ display: inline-block; padding: 4px 10px; margin: 2px 4px 2px 0;
+         border: 1px solid #bbb; border-radius: 4px; text-decoration: none; }}
+  .rounds .now {{ background: #1a4d80; border-color: #1a4d80; color: #fff; font-weight: bold; }}
+  #q {{ width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 1em;
+        border: 1px solid #bbb; border-radius: 4px; margin-bottom: 12px; }}
+  .wrap {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ padding: 6px 8px; border: 1px solid #ddd; text-align: left; white-space: nowrap;
+           font-variant-numeric: tabular-nums; }}
+  th {{ background: #1a4d80; color: #fff; font-weight: 600; }}
+  tr:nth-child(even) td {{ background: #fafafa; }}
+  td.n {{ text-align: right; }}
+  td.g {{ text-align: center; }}
+  td.g b {{ color: #1e6b34; }}
+  td.pr {{ color: #1a4d80; }}
+  td.pc {{ color: #888; font-size: .88em; }}
+  td.pn {{ font-weight: 600; white-space: normal; }}
+  .pend {{ color: #aaa; }}
+  .bd {{ color: #a10000; font-size: .8em; }}
+  .note {{ font-size: .9em; color: #555; }}
+  th.so {{ cursor: pointer; user-select: none; }}
+  th.so:hover {{ background: #235f9c; }}
+  th.so:focus-visible {{ outline: 2px solid #ffd24d; outline-offset: -2px; }}
+  th .ord {{ font-size: .78em; font-weight: 400; margin-left: 3px; white-space: nowrap; }}
+  .sorthint {{ font-size: .9em; color: #555; margin: -6px 0 10px; }}
+  .sorthint b {{ color: #1a4d80; }}
+  .sorthint button {{ font: inherit; color: #0066cc; background: none; border: 0;
+                      padding: 0; cursor: pointer; text-decoration: underline; }}
+  @media (max-width: 640px) {{
+    body {{ margin: 12px auto; font-size: .93em; }}
+    th, td {{ padding: 5px 6px; }}
+    td.pc, th.pc {{ display: none; }}
+    td.s, th.s {{ display: none; }}
+  }}
+</style>
+</head>
+<body>
+<h1>Round {rnd} Cross-tab</h1>
+<p class="sub">{CFG.event_subtitle} &middot;
+{len(table)} players &middot; posted {html.escape(when)}{progress} &middot;
+<a href="./">tournament page</a></p>
+<p class="rounds">{nav}</p>
+<input id="q" type="search" placeholder="Filter by name, club, rank, player number - or an exact score"
+       autocomplete="off" aria-label="Filter the cross-tab">
+<p class="sorthint">Click a column to sort by it; <b>shift-click</b> a second column to
+break ties with it - click <b>NbW</b>, then shift-click <b>MMS</b>, to rank by wins.
+<button type="button" id="reset">Back to placing order</button></p>
+<div class="wrap">
+<table id="x">
+<thead><tr><th class="so" data-c="0" data-d="asc">Num</th>
+<th class="so" data-c="1" data-d="asc">Pl</th>
+<th class="so" data-c="2" data-d="asc">Name</th>
+<th class="so" data-c="3" data-d="desc">Rank</th>
+<th class="so pc" data-c="4" data-d="asc">Club</th>
+<th class="so" data-c="5" data-d="desc">NbW</th>{heads}
+<th class="so" data-c="{mms_col}" data-d="desc">MMS</th>
+<th class="so s" data-c="{sos_col}" data-d="desc">SOS</th>
+<th class="so s" data-c="{sosos_col}" data-d="desc">SOSOS</th></tr></thead>
+<tbody>
+{chr(10).join(rows)}
+</tbody>
+</table>
+</div>
+<p class="note">A round cell reads <em>opponent number</em>, <b>+</b> win or <b>-</b> loss,
+then colour and handicap - so <b>12+/w0</b> is "beat number 12, playing White, even game".
+Bold green is a win; grey means the result is not in yet.
+MMS is the McMahon score; SOS and SOSOS are the tiebreakers.</p>
+<script>
+var tb = document.querySelector('#x tbody');
+var keys = [];                    // [{{c: column, d: 'asc'|'desc'}}]; keys[0] is primary
+
+function val(row, c) {{
+  var td = row.cells[c];
+  if (!td) return '';
+  var v = td.getAttribute('data-v');
+  var t = (v !== null ? v : td.textContent).trim();
+  return (t !== '' && /^-?[0-9.]+$/.test(t)) ? parseFloat(t) : t.toLowerCase();
+}}
+
+function applySort() {{
+  var rows = Array.prototype.slice.call(tb.rows);
+  rows.sort(function (a, b) {{
+    for (var i = 0; i < keys.length; i++) {{
+      var k = keys[i], x = val(a, k.c), y = val(b, k.c);
+      if (x !== y) {{
+        if (x === '') return 1;          // blanks sit last either way
+        if (y === '') return -1;
+        return (x < y ? -1 : 1) * (k.d === 'asc' ? 1 : -1);
+      }}
+    }}
+    return val(a, 0) - val(b, 0);        // ties fall back to the placing order
+  }});
+  rows.forEach(function (r) {{ tb.appendChild(r); }});
+  document.querySelectorAll('#x th.so').forEach(function (th) {{
+    var c = +th.getAttribute('data-c'), at = -1;
+    keys.forEach(function (k, n) {{ if (k.c === c) at = n; }});
+    var badge = th.querySelector('.ord');
+    if (!badge) {{
+      badge = document.createElement('span');
+      badge.className = 'ord';
+      th.appendChild(badge);
+    }}
+    badge.textContent = at < 0 ? '' :
+      (keys[at].d === 'asc' ? ' \u2191' : ' \u2193') + (keys.length > 1 ? (at + 1) : '');
+    th.setAttribute('aria-sort', at < 0 ? 'none'
+      : (keys[at].d === 'asc' ? 'ascending' : 'descending'));
+  }});
+}}
+
+document.querySelectorAll('#x th.so').forEach(function (th) {{
+  th.setAttribute('tabindex', '0');
+  function hit(e) {{
+    var c = +th.getAttribute('data-c'), def = th.getAttribute('data-d'), at = -1;
+    keys.forEach(function (k, n) {{ if (k.c === c) at = n; }});
+    if (e.shiftKey) {{                   // add this column as a tiebreak, or flip it
+      if (at < 0) keys.push({{c: c, d: def}});
+      else keys[at].d = keys[at].d === 'asc' ? 'desc' : 'asc';
+    }} else {{                            // sort by this column alone
+      var flip = (at === 0 && keys.length === 1);
+      keys = [{{c: c, d: flip ? (keys[0].d === 'asc' ? 'desc' : 'asc') : def}}];
+    }}
+    applySort();
+  }}
+  th.addEventListener('click', hit);
+  th.addEventListener('keydown', function (e) {{
+    if (e.key === 'Enter' || e.key === ' ') {{ e.preventDefault(); hit({{shiftKey: e.shiftKey}}); }}
+  }});
+}});
+
+document.getElementById('reset').addEventListener('click', function () {{
+  keys = [];
+  applySort();
+}});
+
+document.getElementById('q').addEventListener('input', function () {{
+  var s = this.value.trim().toLowerCase();
+  document.querySelectorAll('#x tbody tr').forEach(function (row) {{
+    var hit = !s || (row.getAttribute('data-q') || '').indexOf(s) > -1
+              || (row.getAttribute('data-x') || '').split(' ').indexOf(s) > -1;
+    row.style.display = hit ? '' : 'none';
+  }});
+}});
+</script>
+</body>
+</html>
+"""
+
+
+def link_block(rounds: list) -> str:
+    links = " &middot; ".join(
+        f'<a href="crosstab-r{r}.html">Round {r}</a>' for r in rounds)
+    return (f'{MARK_BEGIN}\n'
+            f'<p style="border:2px solid #1a4d80;border-radius:6px;padding:10px 14px;'
+            f'font-size:1.05em"><strong>Standings (cross-tab):</strong> {links}</p>\n'
+            f'{MARK_END}')
+
+
+def update_index(rounds: list) -> None:
+    text = CFG.index_md.read_text()
+    block = link_block(rounds)
+    if MARK_BEGIN in text and MARK_END in text:
+        new = re.sub(re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END),
+                     lambda _: block, text, flags=re.S)
+    else:
+        anchor = "<!-- STANDINGS:END -->"
+        if anchor in text:
+            new = text.replace(anchor, anchor + "\n\n" + block, 1)
+        else:
+            lines = text.split("\n")
+            i = next(n for n, ln in enumerate(lines) if ln.startswith("# ")) + 1
+            new = "\n".join(lines[:i] + ["", block] + lines[i:])
+    if new != text:
+        CFG.index_md.write_text(new)
+
+
+# --------------------------------------------------------------- verify
+
+def verify(table: list, rnd: int) -> int:
+    """Known-answer control: compare against OpenGotha's own StandingsRN export."""
+    src = CFG.export_dir / f"{CFG.tournament}_StandingsR{rnd}.html"
+    if not src.is_file():
+        print(f"no OpenGotha export to check against: {src}")
+        return 2
+    text = src.read_text(encoding="utf-8", errors="replace")
+    ref = []
+    for tr in re.findall(r"<tr>(.*?)</tr>", text, flags=re.S):
+        tds = [re.sub(r"<[^>]+>", "", c).replace("&nbsp;", " ").strip()
+               for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S)]
+        if len(tds) >= 11:
+            ref.append(tds)
+    print(f"control: {src.name}  ({len(ref)} rows vs our {len(table)})")
+    bad = 0
+    for row, p in zip(ref, table):
+        want = (row[2], row[3], row[6], row[-3], row[-2], row[-1])
+        ours = (" ".join(p.name.split()), p.rank, num(p.nbw),
+                num(p.mms), num(p.sos), num(p.sosos))
+        if want != ours:
+            bad += 1
+            print(f"  row {row[0]:>3}: OpenGotha {want}\n           ours      {ours}")
+    if len(ref) != len(table):
+        bad += 1
+    print("MATCH - our numbers reproduce OpenGotha exactly" if not bad
+          else f"{bad} row(s) differ")
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------- main
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Publish the cross-tab standings, computed live from OpenGotha.")
+    tdconfig.add_config_arg(ap)
+    ap.add_argument("-r", "--round", type=int, help="round number (default: newest with results)")
+    ap.add_argument("--deploy", action="store_true", help="build, then run the site deploy command")
+    ap.add_argument("--verify", action="store_true",
+                    help="diff against OpenGotha's own export instead of publishing")
+    ap.add_argument("--dry-run", "-n", action="store_true", help="report only; write nothing")
+    args = ap.parse_args()
+
+    global CFG
+    CFG = tdconfig.load(args.config)
+
+    xml = CFG.newest_xml()
+    players, games, gps, saved = load(xml)
+    if not games:
+        sys.exit("no games in the tournament file yet")
+    paired = sorted({int(g["roundNumber"]) for g in games})
+    scored = sorted({int(g["roundNumber"]) for g in games
+                     if "UNKNOWN" not in g.get("result", "")})
+    rnd = args.round or (scored[-1] if scored else paired[0])
+    if rnd not in paired:
+        sys.exit(f"round {rnd} not paired yet (file has: {paired})")
+
+    table = score(players, games, gps, rnd)
+    print(f"source: {xml}  (saved {saved})")
+    if args.verify:
+        return verify(table, rnd)
+
+    byes = sorted(p.name for p in table if p.bye)
+    if byes:
+        print(f"note: {len(byes)} bye/absence(s) - SOS uses a virtual opponent "
+              f"at the player's own MMS: {', '.join(byes)}")
+    page = build_page(table, gps, saved, rnd, games)
+    out = CFG.site_dir / f"crosstab-r{rnd}.html"
+    print(f"round {rnd}: {len(table)} players -> {out}")
+    if args.dry_run:
+        return 0
+    out.write_text(page)
+    update_index([r for r in paired if (CFG.site_dir / f"crosstab-r{r}.html").is_file()])
+
+    if args.deploy:
+        rc = CFG.deploy([out, CFG.index_md])
+        if rc:
+            return rc
+        print(f"live: {CFG.page_url(out.name)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,173 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Audit a tournament registration sheet's declared ranks against the AGA tdlist.
+
+Policy implemented (AGA practice; adjust to taste for a non-AGA event):
+  * Truncation is the hard rule: +4.98811 -> 4d, +2.77 -> 2d, -3.39 -> 3k.
+  * Measure asks in RANK STEPS, never rating delta.  A delta threshold is wrong
+    in both directions: it misses +1.74 asking 2d (a full rank, delta 0.26) and
+    flags -4.95 asking 4k (no promotion at all, delta 0.95).
+  * +1 promotion  -> auto-deny, no adjudication.
+  * +2 or more    -> the only case a TD actually rules on.
+  * any demotion  -> deny; a demotion is earned by losing games.
+
+Usage:
+    rank-audit --csv registrations.csv
+    rank-audit --sheet <google-sheet-id> [--tab 'Form Responses 1']
+
+The sheet/CSV needs columns named (case-insensitive, substring match):
+  name, AGA ID, rank.  Extra columns are ignored.
+
+The rating list comes from [tdlist] path in tournament.toml (or $AGA_TDLIST);
+`fetch-tdlist` is what puts it there.  --sheet shells out to a Google Sheets
+reader of your choosing - set [sheets] cmd in tournament.toml to a command that
+takes a sheet id and an A1 range and prints TSV on stdout.  --csv needs nothing.
+"""
+import argparse
+import csv
+import io
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+CFG = None      # a tdconfig.Config, set in main() from tournament.toml
+
+
+def load_tdlist(path):
+    """AGA ID -> (rating, sigma, last_rated).  Unrated members are skipped."""
+    out = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9 or not f[1].strip():
+                continue
+            try:
+                rating = float(f[3])
+            except ValueError:
+                continue  # member with no rating on file
+            out[f[1].strip()] = (rating, f[7], f[8])
+    return out
+
+
+def truncate_to_rank(rating):
+    """The hard rule.  Truncate toward zero.  Returns ('d'|'k', n)."""
+    return ("d", int(rating)) if rating > 0 else ("k", int(-rating))
+
+
+def parse_rank(text):
+    m = re.match(r"^\s*(\d+)\s*([dkDK])", text.strip())
+    return (m.group(2).lower(), int(m.group(1))) if m else None
+
+
+def ladder(rank):
+    """Linear rank ladder with no zero rung: 1k=0, 1d=1, 2d=2, 2k=-1, 3k=-2."""
+    kind, n = rank
+    return n if kind == "d" else 1 - n
+
+
+def fmt(rank):
+    return f"{rank[1]}{rank[0]}"
+
+
+def read_sheet(sheet_id, tab):
+    """Delegate to whatever Sheets reader the config names; expects TSV on stdout."""
+    cmd = CFG.sheets_cmd
+    if not cmd:
+        sys.exit("--sheet needs [sheets] cmd in tournament.toml "
+                 "(a command taking SHEET_ID and an A1 range, printing TSV); "
+                 "or export the sheet and use --csv")
+    proc = subprocess.run(cmd + [sheet_id, f"{tab}!A1:Z500"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"sheet read failed: {proc.stderr.strip()}")
+    return [line.split("\t") for line in proc.stdout.splitlines() if line.strip()]
+
+
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        return [row for row in csv.reader(fh) if any(c.strip() for c in row)]
+
+
+def find_columns(header):
+    """Locate name / AGA id / rank columns by substring, tolerating form-question wording."""
+    idx = {}
+    for i, h in enumerate(header):
+        h = h.strip().lower()
+        if "name" in h and "name" not in idx:
+            idx["name"] = i
+        elif "aga" in h and "aga" not in idx:
+            idx["aga"] = i
+        elif "rank" in h and "rank" not in idx:
+            idx["rank"] = i
+    missing = {"name", "aga", "rank"} - idx.keys()
+    if missing:
+        sys.exit(f"could not find column(s) {sorted(missing)} in header: {header}")
+    return idx
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--sheet", help="Google Sheet id")
+    src.add_argument("--csv", help="local CSV instead of a sheet")
+    ap.add_argument("--tab", default="Form Responses 1", help="sheet tab name")
+    tdconfig.add_config_arg(ap)
+    args = ap.parse_args()
+
+    global CFG
+    CFG = tdconfig.load(args.config)
+
+    rows = read_sheet(args.sheet, args.tab) if args.sheet else read_csv(args.csv)
+    if not rows:
+        sys.exit("no rows")
+    col = find_columns(rows[0])
+    td = load_tdlist(CFG.tdlist)
+
+    rated, unrated = [], []
+    for row in rows[1:]:
+        if len(row) <= max(col.values()):
+            row = row + [""] * (max(col.values()) + 1 - len(row))
+        name, aga, asked = row[col["name"]].strip(), row[col["aga"]].strip(), parse_rank(row[col["rank"]])
+        if asked is None:
+            continue
+        if aga not in td:
+            unrated.append((name, aga, fmt(asked)))
+            continue
+        rating, sigma, last = td[aga]
+        book = truncate_to_rank(rating)
+        rated.append((ladder(asked) - ladder(book), name, aga, fmt(book), fmt(asked),
+                      rating, sigma, last))
+
+    promos = sorted([r for r in rated if r[0] >= 1], key=lambda r: (-r[0], -r[5]))
+    demos = sorted([r for r in rated if r[0] <= -1], key=lambda r: r[0])
+
+    print(f"{len(rated)} rated registrants | {len(promos)} promotion asks | "
+          f"{len(demos)} demotion asks | {len(unrated)} unrated\n")
+
+    if promos:
+        print(f"{'steps':>5}  {'name':<24} {'AGA':<7} {'book':<5} {'asks':<5} "
+              f"{'rating':>8} {'sigma':>6}  last game     ruling")
+        print("-" * 100)
+        for d, name, aga, book, asked, rating, sigma, last in promos:
+            ruling = "ADJUDICATE (2+ steps)" if d >= 2 else "auto-deny (1 step)"
+            flag = " 🚩" if d >= 2 else ""
+            print(f"{d:+5d}  {name:<24} {aga:<7} {book:<5} {asked:<5} {rating:>8.2f} "
+                  f"{float(sigma):>6.2f}  {last:<12}  {ruling}{flag}")
+
+    if demos:
+        print(f"\n{len(demos)} asking DOWN - deny all, a demotion is earned by losing games:")
+        for d, name, aga, book, asked, rating, sigma, last in demos:
+            print(f"{d:+5d}  {name:<24} {aga:<7} {book:<5} {asked:<5} {rating:>8.2f}")
+
+    if unrated:
+        print(f"\n{len(unrated)} with no AGA rating on file - resolve from their server rank")
+        print("(a common conversion: Fox/Tygem -2, Pandanet/EGF/CGA +1, Japanese club -1):")
+        for name, aga, asked in unrated:
+            print(f"       {name:<24} {aga:<7} asks {asked}")
+
+
+if __name__ == "__main__":
+    main()

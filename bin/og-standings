@@ -1,0 +1,148 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Publish standings by re-wrapping OpenGotha's own HTML export.
+
+    og-standings             # newest StandingsRN export -> local page
+    og-standings -r 2        # a specific round
+    og-standings --deploy    # build + push the page
+
+The simple route: OpenGotha writes exportfiles/html/<tournament>_StandingsRN.html
+against its own current.css, which is useless on a phone and unusable off the TD
+laptop.  This re-wraps that table in self-contained, mobile-readable page chrome
+and links the rounds to each other.  Export from OpenGotha first (Publish >
+Standings > HTML) - the page stamps that export's own time.
+
+`og-crosstab` is the richer route: it computes MMS/SOS/SOSOS straight from the
+live tournament file, so it needs no Publish click and can refresh mid-round.
+Prefer it unless you specifically want OpenGotha's own table verbatim.  This
+tool deliberately does NOT touch index.md - share the standings-rN.html URL, or
+let og-crosstab own the link row.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tdconfig
+
+CFG = None      # a tdconfig.Config, set in main() from tournament.toml
+
+
+
+HEAD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{CFG.event_title} - Round {rnd} Standings</title>
+<style>
+  body {{ max-width: 900px; margin: 24px auto; padding: 0 16px; color: #333;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }}
+  h1 {{ font-size: 1.5em; margin: 0 0 .15em; text-align: left; }}
+  a {{ color: #0066cc; }}
+  .sub {{ color: #555; margin: 0 0 1em; font-size: .95em; }}
+  .rounds {{ margin: 0 0 1em; font-size: .95em; }}
+  .rounds a, .rounds span {{ display: inline-block; padding: 4px 10px; margin: 2px 4px 2px 0;
+         border: 1px solid #bbb; border-radius: 4px; text-decoration: none; }}
+  .rounds .now {{ background: #1a4d80; border-color: #1a4d80; color: #fff; font-weight: bold; }}
+  #q {{ width: 100%; box-sizing: border-box; padding: 9px 11px; font-size: 1em;
+        border: 1px solid #bbb; border-radius: 4px; margin-bottom: 12px; }}
+  .wrap {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ padding: 6px 8px; border: 1px solid #ddd; text-align: left; white-space: nowrap;
+           font-variant-numeric: tabular-nums; }}
+  th {{ background: #1a4d80; color: #fff; font-weight: 600; }}
+  tr:nth-child(even) td {{ background: #fafafa; }}
+  td b {{ color: #1e6b34; }}
+  h4 {{ font-weight: normal; color: #888; font-size: .85em; margin-top: 1.5em; text-align: left; }}
+</style>
+</head>
+<body>
+<h1>Round {rnd} Standings</h1>
+<p class="sub">{CFG.event_subtitle} &middot;
+{count} players &middot; <a href="./">tournament page</a></p>
+<p class="rounds">{rounds}</p>
+<input id="q" type="search" placeholder="Type a name, club or rank to filter"
+       autocomplete="off" aria-label="Filter standings">
+<div class="wrap">
+"""
+
+TAIL = """</div>
+<script>
+document.getElementById('q').addEventListener('input', function (e) {
+  var t = e.target.value.trim().toLowerCase();
+  document.querySelectorAll('table tr').forEach(function (r, i) {
+    if (r.querySelector('th')) return;
+    r.hidden = t !== '' && r.textContent.toLowerCase().indexOf(t) === -1;
+  });
+});
+</script>
+</body>
+</html>
+"""
+
+
+def exports() -> dict[int, Path]:
+    found = {}
+    for p in CFG.export_dir.glob(f"{CFG.tournament}_StandingsR*.html"):
+        m = re.search(r"StandingsR(\d+)\.html$", p.name)
+        if m:
+            found[int(m.group(1))] = p
+    return found
+
+
+def build_page(src: str, rnd: int, have: list[int]) -> str:
+    body = src[src.index("<table"):src.rindex("</html>")]
+    body = body.replace('<table align="center" class="simple">', "<table>", 1)
+    body = re.sub(r'\s*align=\"?(center|right|left)\"?', "", body)
+    body = body.replace("<h4>", '<h4 class="stamp">')
+    # OpenGotha opens the header row implicitly; give it a real <tr>.
+    body = body.replace("<table>\n<th", "<table>\n<tr><th", 1)
+    count = len(re.findall(r"<tr><td", body))
+    rounds = " ".join(
+        (f'<span class="now">Round {r}</span>' if r == rnd
+         else f'<a href="standings-r{r}.html">Round {r}</a>') for r in have)
+    return HEAD.format(rnd=rnd, count=count, rounds=rounds) + body + TAIL
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Publish standings from an OpenGotha HTML export.")
+    tdconfig.add_config_arg(ap)
+    ap.add_argument("-r", "--round", type=int, help="round number (default: newest exported)")
+    ap.add_argument("--deploy", action="store_true", help="build, then run the site deploy command")
+    ap.add_argument("--dry-run", "-n", action="store_true", help="report only; write nothing")
+    args = ap.parse_args()
+
+    global CFG
+    CFG = tdconfig.load(args.config)
+
+    found = exports()
+    if not found:
+        sys.exit(f"no standings export found in {CFG.export_dir} "
+                 "(OpenGotha: Publish > Standings > HTML)")
+    have = sorted(found)
+    rnd = args.round or have[-1]
+    if rnd not in found:
+        sys.exit(f"round {rnd} not exported yet (have: {have})")
+
+    src = found[rnd].read_text(encoding="utf-8", errors="replace")
+    page = build_page(src, rnd, have)
+    out = CFG.site_dir / f"standings-r{rnd}.html"
+    print(f"source: {found[rnd]}")
+    print(f"round {rnd} -> {out}")
+    if args.dry_run:
+        return 0
+    out.write_text(page)
+
+    if args.deploy:
+        rc = CFG.deploy([out])
+        if rc:
+            return rc
+        print(f"live: {CFG.page_url(out.name)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

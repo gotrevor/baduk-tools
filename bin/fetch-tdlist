@@ -1,0 +1,293 @@
+#!/usr/bin/env -S uv run --quiet python3
+"""Download + timestamp the AGA TDList (aka tdlista) rating list.
+
+The point of the timestamping: capture a snapshot the day BEFORE a tournament
+and another AFTER the AGA rating update, then feed both to rating_changes.py to
+report how each player's rating moved.
+
+    fetch-tdlist --label pre-neopen        # day before
+    ...tournament happens, AGA runs ratings...
+    fetch-tdlist --label post-neopen       # after the update
+    fetch-tdlist --list                    # find the two snapshot paths
+    rating-changes results.txt <pre.tsv> <post.tsv>
+
+Files:
+    ~/personal/data/aga/tdlist.tsv                      current (variant A)
+    ~/personal/data/aga/archive/tdlist-YYYYMMDD-HHMM[-label].tsv
+
+The A variant is byte-identical in format to OpenGotha's ratinglists/tdlista.txt,
+so a successful fetch also refreshes OpenGotha's copy in place (--no-opengotha
+to skip).  That is the same file OpenGotha's own "Update AGA rating list from..."
+button downloads.
+
+Variants: A = chapter short code (default, what everything here consumes),
+          B = chapter full name, N = fixed-width rather than tab-separated.
+"""
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# The Azure host carries a RANDOM SUFFIX and has already rotated once: the old
+# aga-functions.azurewebsites.net went 403 "web app is stopped" and the local copy
+# sat frozen for ~6 months while every consumer silently answered from it.
+#
+# So resolve it at runtime.  https://www.usgo.org/TDList{A,B,N} is the AGA's stable,
+# documented handle -- but it is NOT an HTTP redirect (curl -L follows nothing).  It
+# is a ClubExpress page carrying a JS redirect:
+#     window.location.href='https://aga-membership-functions-….azurewebsites.net/api/GenerateTDListA'
+# ClubExpress also 403s the default urllib User-Agent, hence UA below.
+RESOLVER = "https://www.usgo.org/TDList{variant}"
+KNOWN_FALLBACK = (
+    "https://aga-membership-functions-fmgchkbxa3hxd8h0.westus-01.azurewebsites.net"
+    "/api/GenerateTDList"
+)
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+DATA_DIR = Path(os.environ.get("AGA_DATA_DIR", Path.home() / "personal" / "data" / "aga"))
+ARCHIVE_DIR = DATA_DIR / "archive"
+CURRENT_FILE = DATA_DIR / "tdlist.tsv"
+OPENGOTHA_HOME = Path(
+    os.environ.get("OPENGOTHA_HOME", Path.home() / "Applications" / "OpenGotha-3.52.03")
+)
+MIN_BYTES = 100_000  # a real list is ~1 MB; anything smaller is an error page
+STALE_DAYS = 30
+
+EXIT_OK, EXIT_ERROR, EXIT_ENDPOINT_DOWN = 0, 1, 2
+
+
+def _open(url: str, timeout: int = 90):
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": UA}), timeout=timeout
+    )
+
+
+_url_cache: dict[str, str] = {}
+
+
+def url_for(variant: str) -> str:
+    """Resolve the live GenerateTDList<variant> URL via the AGA's usgo.org handle."""
+    override = os.environ.get("AGA_TDLIST_URL")
+    if override:
+        return override
+    if variant in _url_cache:
+        return _url_cache[variant]
+
+    resolver = RESOLVER.format(variant=variant)
+    url = f"{KNOWN_FALLBACK}{variant}"
+    try:
+        page = _open(resolver, timeout=30).read().decode("utf-8", "replace")
+        m = re.search(r"""https://[^\s'"]*GenerateTDList[A-Z]?""", page)
+        if m:
+            url = m.group(0)
+            if not url.endswith(variant):  # page served a different variant's link
+                url = re.sub(r"GenerateTDList[A-Z]?$", f"GenerateTDList{variant}", url)
+        else:
+            print(f"⚠️  No GenerateTDList URL on {resolver} - using last-known endpoint.",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"⚠️  Could not reach {resolver} ({e}) - using last-known endpoint.",
+              file=sys.stderr)
+
+    _url_cache[variant] = url
+    return url
+
+
+def prefix_for(variant: str) -> str:
+    # Variant A keeps the historical bare "tdlist-" prefix so existing snapshots
+    # and anything that globs them keep working.
+    return "tdlist" if variant == "A" else f"tdlist{variant}"
+
+
+def snapshots(variant: str) -> list[Path]:
+    if not ARCHIVE_DIR.is_dir():
+        return []
+    pre = prefix_for(variant)
+    hits = [
+        p
+        for p in ARCHIVE_DIR.glob(f"{pre}-*.tsv")
+        # "tdlist-*" would otherwise also match tdlistB-* / tdlistN-*
+        if variant != "A" or p.name[len(pre) + 1].isdigit()
+    ]
+    # by mtime, not name: two snapshots in the same minute differ only by label
+    return sorted(hits, key=lambda p: p.stat().st_mtime)
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def describe_age(path: Path) -> str:
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    days = (datetime.now() - mtime).days
+    flag = "  🚨 STALE" if days > STALE_DAYS else ""
+    return f"{mtime:%Y-%m-%d %H:%M} ({days} days old){flag}"
+
+
+def diagnose(err: Exception, url: str) -> int:
+    """Explain a failure in terms of the actual cause, not just the status code."""
+    body = ""
+    code = None
+    if isinstance(err, urllib.error.HTTPError):
+        code = err.code
+        try:
+            body = err.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+
+    stopped = "web app is stopped" in body.lower() or "Web App - Unavailable" in body
+    if stopped or (code == 403 and "azurewebsites.net" in url):
+        print(f"❌ The AGA's TDList endpoint is DOWN: HTTP {code} from {url}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("   Azure is serving its *app stopped* page:", file=sys.stderr)
+        print('   "This web app is stopped and does not accept any requests."', file=sys.stderr)
+        print(file=sys.stderr)
+        print("   This is NOT a rate limit, a bot block, or a bad URL - the Azure", file=sys.stderr)
+        print("   Function behind the TDList has been stopped or deprovisioned, so", file=sys.stderr)
+        print("   it is down for every AGA tournament director nationally, including", file=sys.stderr)
+        print("   OpenGotha's built-in 'Update AGA rating list from...' button.", file=sys.stderr)
+        print("   Only the AGA can fix it.  See knowledge/todos/open/aga-tdlist-endpoint-stopped.md", file=sys.stderr)
+        return EXIT_ENDPOINT_DOWN
+
+    print(f"❌ Download failed: {err}  ({url})", file=sys.stderr)
+    return EXIT_ERROR
+
+
+def probe(variant: str) -> int:
+    url = url_for(variant)
+    print(f"🔎 Probing {url}", flush=True)  # flush: keep ordering vs stderr diagnostics
+    try:
+        with _open(url, timeout=30) as resp:
+            head = resp.read(MIN_BYTES)
+        print(f"   ✅ UP - HTTP {resp.status}, first {len(head):,} bytes look like a list")
+        return EXIT_OK
+    except Exception as e:
+        return diagnose(e, url)
+
+
+def fetch(variant: str, label: str | None, force: bool, to_opengotha: bool) -> int:
+    url = url_for(variant)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = DATA_DIR / f"tdlist{variant}.tmp"
+
+    print(f"📥 Downloading TDList{variant} from {url}")
+    try:
+        data = _open(url).read()
+        temp_file.write_bytes(data)
+    except Exception as e:
+        temp_file.unlink(missing_ok=True)
+        return diagnose(e, url)
+
+    size = temp_file.stat().st_size
+    if size < MIN_BYTES:
+        print(f"❌ Download seems incomplete ({size:,} bytes, expected >{MIN_BYTES:,})", file=sys.stderr)
+        print("   Refusing to overwrite a good list with an error page.", file=sys.stderr)
+        temp_file.unlink()
+        return EXIT_ERROR
+    if b"<html" in data[:500].lower() or data.lstrip()[:16].lower().startswith(b"<!doctype"):
+        # A ClubExpress error page is ~21KB, i.e. it sails past MIN_BYTES.
+        print("❌ Got an HTML page, not a rating list - endpoint down or blocked.", file=sys.stderr)
+        temp_file.unlink()
+        return EXIT_ENDPOINT_DOWN
+
+    lines = sum(1 for _ in temp_file.open(encoding="utf-8", errors="replace"))
+    print(f"   ✅ {lines:,} entries, {size:,} bytes")
+
+    # Don't manufacture a second snapshot of a list that hasn't changed - the
+    # archive picked up three byte-identical copies that way once.  This governs
+    # the ARCHIVE only: the current file and OpenGotha's copy are still published
+    # below, or a first run against an unchanged list would never seed them.
+    prior = snapshots(variant)
+    unchanged = bool(prior) and not force and digest(temp_file) == digest(prior[-1])
+
+    if unchanged:
+        print(f"🟰 Byte-identical to {prior[-1].name} - no new snapshot (--force to override)")
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        suffix = f"-{label}" if label else ""
+        snapshot = ARCHIVE_DIR / f"{prefix_for(variant)}-{stamp}{suffix}.tsv"
+        shutil.copy(temp_file, snapshot)
+        print(f"📦 Snapshot → archive/{snapshot.name}")
+
+    if variant == "A":
+        temp_file.replace(CURRENT_FILE)
+        print(f"📄 Current  → {CURRENT_FILE}")
+        if to_opengotha:
+            gotha = OPENGOTHA_HOME / "ratinglists" / "tdlista.txt"
+            if gotha.parent.is_dir():
+                if not gotha.exists() or digest(gotha) != digest(CURRENT_FILE):
+                    shutil.copy(CURRENT_FILE, gotha)
+                    print(f"⚫ OpenGotha → {gotha}")
+                else:
+                    print(f"⚫ OpenGotha already in sync")
+    else:
+        temp_file.unlink()
+
+    return EXIT_OK
+
+
+def show_list() -> int:
+    for variant in ("A", "B", "N"):
+        snaps = snapshots(variant)
+        if not snaps:
+            continue
+        print(f"=== TDList{variant} - {len(snaps)} snapshot(s) ===")
+        for p in snaps:
+            print(f"  {p}   {datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}")
+    if CURRENT_FILE.exists():
+        print(f"\n📄 current: {CURRENT_FILE}\n   {describe_age(CURRENT_FILE)}")
+    return EXIT_OK
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Download + timestamp the AGA TDList (tdlista).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("-v", "--variant", default="A", choices=["A", "B", "N"], help="default: A")
+    ap.add_argument("--all", action="store_true", help="fetch all three variants")
+    ap.add_argument("--label", help="tag the snapshot, e.g. --label pre-neopen")
+    ap.add_argument("--force", action="store_true", help="snapshot even if unchanged")
+    ap.add_argument("--no-opengotha", action="store_true", help="skip refreshing OpenGotha's copy")
+    ap.add_argument("--check", action="store_true", help="probe the endpoint, download nothing")
+    ap.add_argument("--list", action="store_true", help="list existing snapshots")
+    ap.add_argument("--max-age", type=float, metavar="HOURS",
+                    help="do nothing if the current list is newer than HOURS "
+                         "(for callers that just want a once-a-day-fresh copy)")
+    args = ap.parse_args()
+
+    if args.list:
+        return show_list()
+    if args.check:
+        return probe(args.variant)
+
+    if (args.max_age is not None and CURRENT_FILE.exists()
+            and CURRENT_FILE.stat().st_size >= MIN_BYTES):
+        age_h = (time.time() - CURRENT_FILE.stat().st_mtime) / 3600.0
+        if age_h < args.max_age:
+            print(f"✅ {CURRENT_FILE.name} is {age_h:.1f}h old (< {args.max_age}h) - using cache.")
+            return EXIT_OK
+
+    variants = ["A", "B", "N"] if args.all else [args.variant]
+    rc = EXIT_OK
+    for v in variants:
+        rc = max(rc, fetch(v, args.label, args.force, not args.no_opengotha))
+
+    if CURRENT_FILE.exists():
+        print(f"\n📄 current list: {describe_age(CURRENT_FILE)}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

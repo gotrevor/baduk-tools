@@ -1,0 +1,24 @@
+# Copy to ./tournament.toml, or to ~/.config/baduk-tools/tournament.toml, and edit.
+# Every tool in bin/ reads it; --config PATH or $BADUK_TOURNAMENT_CONFIG override.
+
+[opengotha]
+home       = "~/Applications/OpenGotha-3.52.03"
+tournament = "NEOpen2026"        # basename of the .xml OpenGotha is running
+
+[event]
+title    = "NE Open 2026"
+subtitle = "5th New England Go Open &middot; Hopkinton Center for the Arts"
+
+[site]
+dir    = "~/src/wmgc/ne-open-2026"
+repo   = "~/src/wmgc"
+url    = "https://wmgc.massgo.org/ne-open-2026/"
+deploy = ["bin/deploy"]                     # run from `repo`; page paths appended
+
+[tdlist]
+path = "~/personal/data/aga/tdlist.tsv"
+
+[sheets]
+# Optional, only for `rank-audit --sheet`: any command that takes a sheet id and an
+# A1 range and prints TSV on stdout.
+# cmd = ["gdrive", "-a", "personal", "sheets", "read"]
