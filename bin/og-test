@@ -1,0 +1,19 @@
+#!/usr/bin/env -S uv run --quiet --with pytest python3
+"""Run the test suite.  No install step, no virtualenv to make - uv handles it.
+
+    og-test              # everything
+    og-test -k doctor    # any pytest argument passes straight through
+
+The suite never touches a real tournament: fixtures build a synthetic 8-player
+event and a pretend site under pytest's tmp_path.
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if __name__ == "__main__":
+    raise SystemExit(subprocess.run(
+        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q", *sys.argv[1:]],
+        cwd=ROOT).returncode)

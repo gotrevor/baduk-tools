@@ -62,8 +62,9 @@ deploy time, so results entered afterwards are invisible until someone re-runs
 the publisher — which is what `og-stale` exists to catch.  Run it after every
 batch of slips; it exits 1 and prints the exact redeploy command.
 
-Mid-tournament, a TD is busy and stressed.  Prefer running the command and
-reporting the result over handing them a command to type.
+Mid-tournament, a TD is busy and focused - deep in pairings, slips and the next
+round.  Prefer running the command and reporting the result over handing them a
+command to type.
 
 ## If you are changing the code
 
@@ -76,6 +77,11 @@ reporting the result over handing them a command to type.
 - `og-crosstab` reads the tournament's own `GeneralParameterSet` for the MM bar,
   floor, zero and bye/absent values, so a parameter change in OpenGotha is picked
   up automatically.  Do not reimplement the scoring rules as constants.
+- **Run `bin/og-test` before and after any change**, and add a case for what you
+  changed.  Fixtures are synthetic and live in `tests/fixtures/`; keep them that
+  way — a real registrant's name does not belong in a public test suite.  Assert
+  scoring against numbers you worked out from the fixture by hand, never against
+  output you captured from the tool you are testing.
 - **The known-answer control is `og-crosstab --verify`**: it diffs our computed
   MMS/SOS/SOSOS against OpenGotha's own exported StandingsRN.html, row by row.
   Run it after touching any scoring code.  A refactor that changes no behaviour

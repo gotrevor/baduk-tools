@@ -171,7 +171,7 @@ def load(explicit: str | None = None) -> Config:
         if named:
             path = Path(named).expanduser()
             if not path.is_file():
-                sys.exit(f"{where} names {path}, which does not exist")
+                sys.exit(f"{where} names {path}, which does not exist" + AGENT_HINT)
             return _read(path)
 
     tried = []

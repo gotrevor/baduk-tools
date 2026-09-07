@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<Tournament fullVersionNumber="3.52.03" privateTournament="false" runningMode="SAL" saveDT="20260101120000">
+    <Players>
+        <Player agaExpirationDate="6/1/2027" agaId="90001" club="WMGC" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Rowan" grade=" 5D" name="Aldergate" participating="11111111111111111111" rank="5D" rating="2500" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90002" club="WMGC" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Sasha" grade=" 3D" name="Brightwood" participating="11111111111111111111" rank="3D" rating="2300" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90003" club="MGA" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Imre" grade=" 1D" name="Calloway" participating="11111111111111111111" rank="1D" rating="2100" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90004" club="MGA" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Petra" grade=" 1K" name="Dunmore" participating="11111111111111111111" rank="1K" rating="1900" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90005" club="MGA" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Nia" grade=" 4K" name="Everard" participating="11111111111111111111" rank="4K" rating="1600" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90006" club="NYGA" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Tomas" grade=" 7K" name="Fairweather" participating="11111111111111111111" rank="7K" rating="1300" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90007" club="NYGA" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Ada" grade="10K" name="Grissom" participating="11111111111111111111" rank="10K" rating="1000" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+        <Player agaExpirationDate="6/1/2027" agaId="90008" club="" country="US" egfPin="" ffgLicence="" ffgLicenceStatus="" firstName="Bo" grade="15K" name="Halloran" participating="11111111111111111111" rank="15K" rating="600" ratingOrigin="AGA : 1.0" registeringStatus="FIN" smmsCorrection="0" userName=""/>
+    </Players>
+    <Games>
+        <Game blackPlayer="EVERARDNIA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="1" tableNumber="1" whitePlayer="ALDERGATEROWAN"/>
+        <Game blackPlayer="FAIRWEATHERTOMAS" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="1" tableNumber="2" whitePlayer="BRIGHTWOODSASHA"/>
+        <Game blackPlayer="GRISSOMADA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="1" tableNumber="3" whitePlayer="CALLOWAYIMRE"/>
+        <Game blackPlayer="HALLORANBO" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="1" tableNumber="4" whitePlayer="DUNMOREPETRA"/>
+        <Game blackPlayer="BRIGHTWOODSASHA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="2" tableNumber="1" whitePlayer="ALDERGATEROWAN"/>
+        <Game blackPlayer="DUNMOREPETRA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="2" tableNumber="2" whitePlayer="CALLOWAYIMRE"/>
+        <Game blackPlayer="FAIRWEATHERTOMAS" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="2" tableNumber="3" whitePlayer="EVERARDNIA"/>
+        <Game blackPlayer="HALLORANBO" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="2" tableNumber="4" whitePlayer="GRISSOMADA"/>
+        <Game blackPlayer="CALLOWAYIMRE" handicap="0" knownColor="true" result="RESULT_BLACKWINS" roundNumber="3" tableNumber="1" whitePlayer="ALDERGATEROWAN"/>
+        <Game blackPlayer="DUNMOREPETRA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="3" tableNumber="2" whitePlayer="BRIGHTWOODSASHA"/>
+        <Game blackPlayer="GRISSOMADA" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="3" tableNumber="3" whitePlayer="EVERARDNIA"/>
+        <Game blackPlayer="HALLORANBO" handicap="0" knownColor="true" result="RESULT_WHITEWINS" roundNumber="3" tableNumber="4" whitePlayer="FAIRWEATHERTOMAS"/>
+    </Games>
+    <TournamentParameterSet>
+        <GeneralParameterSet basicTime="0" beginDate="2026-01-01" complementaryTimeSystem="SUDDENDEATH" director="Test Director" endDate="2026-01-02" fischerTime="10" genCountNotPlayedGamesAsHalfPoint="false" genMMBar="5D" genMMFloor="28K" genMMS2ValueAbsent="1" genMMS2ValueBye="2" genMMZero="30K" genNBW2ValueAbsent="0" genNBW2ValueBye="2" genRoundDownNBWMMS="true" komi="7.5" location="Nowhere, MA" name="Fixture Open 2026" numberOfCategories="1" numberOfRounds="3" shortName="FixtureOpen" size="19"/>
+    </TournamentParameterSet>
+</Tournament>
