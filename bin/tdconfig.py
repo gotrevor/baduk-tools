@@ -46,8 +46,8 @@ from pathlib import Path
 AGENT_HINT = """
 Stuck?  These tools are meant to be driven by an agent.  From the repo root:
 
-    claude "read AGENTS.md and set up baduk-tools for my tournament"
-    codex   "read AGENTS.md and set up baduk-tools for my tournament"
+    claude "set up baduk-tools for my tournament"
+    codex  "read AGENTS.md and set up baduk-tools for my tournament"
 
 AGENTS.md tells it how to find your OpenGotha install, write tournament.toml,
 and verify the result with `og-doctor`.

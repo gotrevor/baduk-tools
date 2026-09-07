@@ -1,5 +1,8 @@
 # AGENTS.md — setting up and running baduk-tools
 
+*(`CLAUDE.md` in this repo is a one-line `@AGENTS.md` include, so Claude Code loads
+this file automatically.)*
+
 You are reading this because someone pointed you at this repo, probably with
 something like *"set up baduk-tools for my tournament."*  This file is written
 for you, not for them.  The human is a **tournament director**: they know Go and

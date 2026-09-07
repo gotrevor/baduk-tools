@@ -56,7 +56,8 @@ export PATH="$PWD/bin:$PATH"
 have a frontier model on hand, and [`AGENTS.md`](AGENTS.md) is written for one:
 
 ```sh
-claude "read AGENTS.md and set up baduk-tools for my tournament"
+claude "set up baduk-tools for my tournament"    # CLAUDE.md loads AGENTS.md for you
+codex  "read AGENTS.md and set up baduk-tools for my tournament"
 ```
 
 It will find your OpenGotha installation and tournament file itself, ask you only
