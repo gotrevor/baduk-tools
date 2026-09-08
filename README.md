@@ -19,12 +19,12 @@ can check pairings from the parking lot and a parent can follow along from home.
 |---|---|
 | `og-pairings` | Round pairings → a self-contained page.  Winners go green as results are entered, so a link posted at pairing time keeps working all round. |
 | `og-crosstab` | Cross-tab standings **computed live** from the tournament file — MMS / SOS / SOSOS, no Publish click, refreshable mid-round.  Reads the tournament's own `GeneralParameterSet`, so a parameter change in OpenGotha is picked up here.  `--verify` diffs our numbers against OpenGotha's own export as a known-answer control. |
-| `og-test` | The test suite — 85 tests over a synthetic 8-player tournament and a pretend site.  `og-test` runs it; no install step. |
+| `og-test` | The test suite — 138 tests over a synthetic 8-player tournament and a pretend site.  `og-test` runs it; no install step. |
 | `og-doctor` | Does every path in your config actually resolve?  PASS / FAIL / SKIP per setting, with the value it checked.  Run it before round 1. |
 | `og-stale` | **The check you will forget.**  Every published page is a snapshot taken at deploy time; results entered afterwards are invisible until someone re-runs the publisher, and nothing else notices.  This compares each deployed page against the live XML and prints the exact redeploy command.  Exits 1 if anything is stale. |
 
 The usual rhythm: pair the round in OpenGotha → **save** → `og-pairings --deploy`
-→ enter result slips → `og-stale` → redeploy whatever it flags.  Save first,
+→ enter the results → `og-stale` → redeploy whatever it flags.  Save first,
 always: the tools read the file on disk, not OpenGotha's memory, and the page
 stamps that save time.
 
@@ -57,12 +57,45 @@ file and the audit stops asking — which is what keeps the report worth reading
 and a genuinely wrong id from hiding in a wall of warnings you have learned to
 skip.
 
+**`go-roster ogs`** cross-checks against [Online-Go](https://online-go.com/) when
+your form collects a handle.  It earns its place on registrants with **no AGA
+rating at all**, where an online rank is the only evidence anyone has for an
+entry rank; for rated players it just reports where the two scales disagree by
+five stones or more, and the AGA rating stands.  Handles are never fuzzy-matched
+— a near miss on OGS is a *different person*.
+
 **Why `ranks` measures in steps.**  Truncation is the hard rule (+4.98811 is a
 4d, emphatically not a 5d), and asks are measured in **rank steps**, never rating
 delta.  A delta threshold is wrong in both directions: it misses +1.74 asking 2d
 (a full rank, delta 0.26) and flags −4.95 asking 4k (no promotion at all, delta
 0.95).  One step up is auto-deny; two or more is the only case a TD actually
 rules on; a demotion ask is denied, because a demotion is earned by losing games.
+
+## The check-in sheet
+
+```sh
+go-roster signin --csv registrations.csv        # before the event
+go-roster signin --round 2 --day "Day 2"        # mid-event, from OpenGotha
+```
+
+A Letter-size PDF, one row per player with a box to initial, sorted by **last
+name** — the order a person standing at the desk searches in, not the order the
+standings use.  Pages split evenly (80 players over 3 pages is 27/27/26, not
+30/30/20), which stops the last sheet ending in half a page of white and stops
+everyone queueing at page one.  Outline and rule only: it prints on a mono laser
+without eating toner.
+
+With `--round N` it reads the live tournament file instead of the registration
+list, so it prints who is *still playing* — a registration list would happily
+print someone who left after round 2.  `--add` / `--drop` override that, and say
+so on the console rather than silently.
+
+**On paper generally**: plenty of tournaments take registration, check-in and
+results electronically, and these tools are happy either way.  But a sheet with a
+player's own initials on it survives a laptop dying, a spreadsheet being edited,
+and an argument about who was in the room for round 3.  Same reasoning as a
+voter-verifiable paper trail — the electronic system is the fast path, the paper
+is the copy you can hold up afterwards.  Worth keeping both.
 
 ## AGA rating list
 

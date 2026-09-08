@@ -3,8 +3,8 @@
 
 Every published page is a static snapshot of the OpenGotha XML at deploy time, so
 each result entered afterwards leaves the live page showing fewer winners than the
-file knows about - and nothing else notices.  Run this after every batch of result
-slips, and redeploy whatever it flags; it prints the exact command line.
+file knows about - and nothing else notices.  Run this after every batch of
+results, and redeploy whatever it flags; it prints the exact command line.
 
 Exits 1 if anything is stale, so it also works as a gate.
 """

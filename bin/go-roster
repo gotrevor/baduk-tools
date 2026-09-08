@@ -1,9 +1,12 @@
 #!/usr/bin/env -S uv run --quiet python3
 """Check a registration list against the AGA rating list, before you pair.
 
-    go-roster check --csv registrations.csv     # both audits (the usual call)
-    go-roster ids   --csv registrations.csv     # is each AGA id the right person?
-    go-roster ranks --csv registrations.csv     # is each declared rank the book rank?
+    go-roster check  --csv registrations.csv    # both audits (the usual call)
+    go-roster ids    --csv registrations.csv    # is each AGA id the right person?
+    go-roster ranks  --csv registrations.csv    # is each declared rank the book rank?
+    go-roster ogs    --csv registrations.csv    # cross-check against Online-Go
+    go-roster signin --csv registrations.csv    # the printed check-in sheet
+    go-roster signin --round 2                  # ... mid-event, from OpenGotha
     go-roster --sheet <id> --tab 'Form Responses 1' check
 
 The list needs columns whose headers CONTAIN "name", "aga" and "rank"
@@ -33,6 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agaid
+import ogs as ogsmod
+import signin as signinmod
 import tdconfig
 
 
@@ -57,11 +62,17 @@ def read_sheet_rows(cfg, sheet_id, tab):
 
 
 def find_columns(header):
-    """Locate name / AGA id / rank by substring, tolerating form-question wording."""
+    """Locate name / AGA id / rank / OGS by substring, tolerating question wording.
+
+    OGS is optional: only `go-roster ogs` needs it.  It is matched before "name"
+    so a header like "OGS username" does not get claimed as the player's name.
+    """
     idx = {}
     for i, h in enumerate(header):
         h = h.strip().lower()
-        if "name" in h and "name" not in idx:
+        if "ogs" in h or "online-go" in h or "online go" in h:
+            idx.setdefault("ogs", i)
+        elif "name" in h and "name" not in idx:
             idx["name"] = i
         elif "aga" in h and "aga" not in idx:
             idx["aga"] = i
@@ -84,7 +95,8 @@ def registrants(rows):
         row = list(row) + [""] * (width - len(row))
         out.append({"name": row[col["name"]].strip(),
                     "aga_id": row[col["aga"]].strip(),
-                    "asked": row[col["rank"]].strip()})
+                    "asked": row[col["rank"]].strip(),
+                    "ogs": row[col["ogs"]].strip() if "ogs" in col else ""})
     return out
 
 
@@ -229,33 +241,148 @@ def audit_ranks(people, tdlist) -> int:
     return len([p for p in promos if p[3] == agaid.ADJUDICATE])
 
 
+
+# --- the OGS cross-check ------------------------------------------------------
+
+#: Report-only.  A gap this wide means "look at this", never "override the AGA".
+DIVERGENCE_STONES = 5
+
+
+def audit_ogs(people, tdlist, cache_path, refresh=False) -> int:
+    """Compare each player's OGS strength against their AGA rating.
+
+    Evidence, not an answer: the scales are fitted to different populations, so a
+    small gap is noise.  It earns its place on the players with NO AGA rating,
+    where an OGS rank is the only number anyone has.
+    """
+    handles = sorted({r["ogs"] for r in people if r.get("ogs")})
+    if not handles:
+        print("\nno OGS column in the registration list (nothing to check)")
+        return 0
+    found, misses = ogsmod.fetch(handles, cache_path, refresh=refresh)
+    print(f"\nOGS: {len(found)} of {len(handles)} handles resolved")
+
+    wide, unrated = [], []
+    for r in people:
+        p = found.get(r.get("ogs") or "")
+        if not p:
+            continue
+        og = ogsmod.rank_stones(p["ranking"])
+        rec = tdlist.get(r["aga_id"])
+        ag = agaid.rating_to_stones(rec["rating"]) if rec and rec.get("rating") is not None else None
+        if ag is None:
+            unrated.append((r, p))
+        elif og is not None and abs(og - ag) >= DIVERGENCE_STONES:
+            wide.append((r, p, ag - og))
+
+    if unrated:
+        print(f"\n📊 No AGA rating, but they play online ({len(unrated)}) - "
+              f"the OGS rank is the evidence you have:")
+        for r, p in unrated:
+            prov = "  ⚠️ provisional" if p["provisional"] else ""
+            print(f"   {r['name']:<24} {p['username']:<18} "
+                  f"{ogsmod.rank_str(p['ranking']):>7} OGS   asks {r['asked']}{prov}")
+
+    if wide:
+        print(f"\n↔️  AGA and OGS disagree by {DIVERGENCE_STONES}+ stones ({len(wide)}) - "
+              f"report only, the AGA rating stands:")
+        for r, p, gap in sorted(wide, key=lambda t: -abs(t[2])):
+            print(f"   {r['name']:<24} AGA {agaid.rating_to_rank(tdlist[r['aga_id']]['rating']):<4} "
+                  f"vs OGS {ogsmod.rank_str(p['ranking']):>7}   ({gap:+d} stones)")
+
+    if misses:
+        print(f"\n❔ No OGS account under these handles ({len(misses)}): "
+              + ", ".join(misses))
+        print("   (deliberately not fuzzy-matched: a near miss on OGS is a "
+              "different person)")
+    return len(unrated)
+
+
+# --- the check-in sheet -------------------------------------------------------
+
+def build_signin(cfg, people, tdlist, args) -> int:
+    title = f"{cfg.event_title} - check-in" if args.day is None else \
+            f"{cfg.event_title} - {args.day}"
+    if args.round:
+        rows, forced, stamp = signinmod.rows_from_opengotha(
+            cfg.newest_xml(), args.round,
+            add=args.add or (), drop=args.drop or ())
+        source = f"still playing in round {args.round} &middot; tournament file saved {stamp}"
+        if forced:
+            print(f"forced onto the sheet despite not being marked playing: "
+                  + ", ".join(forced))
+    else:
+        rows, dropped = signinmod.rows_from_registrations(people, tdlist)
+        source = f"{len(rows)} registered"
+        if dropped:
+            print(f"{dropped} withdrawn registrant(s) left off the sheet")
+
+    if not rows:
+        sys.exit("nobody to put on the sheet")
+    subtitle = f"{source} &middot; <b>initial the box if you are here</b>"
+    page = signinmod.render_html(rows, title, subtitle)
+    out = Path(args.out).expanduser() if args.out else Path.cwd() / "signin.pdf"
+    pages = len(signinmod.page_split(len(rows)))
+    print(f"{len(rows)} players over {pages} page(s) -> {out}")
+    if args.html:
+        out = out.with_suffix(".html")
+        out.write_text(page)
+        return 0
+    signinmod.to_pdf(page, out)
+    return 0
+
+
 # --- CLI ----------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", choices=("check", "ids", "ranks"), nargs="?", default="check")
-    src = ap.add_mutually_exclusive_group(required=True)
+    ap.add_argument("what", choices=("check", "ids", "ranks", "ogs", "signin"),
+                    nargs="?", default="check")
+    src = ap.add_mutually_exclusive_group()
     src.add_argument("--csv", help="registration list as CSV")
     src.add_argument("--sheet", help="Google Sheet id (needs [sheets] cmd)")
     ap.add_argument("--tab", default="Form Responses 1", help="sheet tab name")
     ap.add_argument("--acks", help="JSON of weak matches already accepted")
     ap.add_argument("--show-ok", action="store_true", help="also list the clean matches")
+    ap.add_argument("--refresh", action="store_true", help="ogs: bypass the 24h cache")
+    ap.add_argument("--round", type=int, metavar="N",
+                    help="signin: take who is still playing from the tournament file")
+    ap.add_argument("--day", metavar="LABEL", help="signin: heading label, e.g. 'Day 2'")
+    ap.add_argument("--add", action="append", metavar="AGA_ID",
+                    help="signin: force a player on despite the participating flag")
+    ap.add_argument("--drop", action="append", metavar="AGA_ID",
+                    help="signin: force a player off")
+    ap.add_argument("--html", action="store_true",
+                    help="signin: write HTML instead of rendering a PDF")
+    ap.add_argument("--out", metavar="PATH", help="signin: output file (default ./signin.pdf)")
     tdconfig.add_config_arg(ap)
     args = ap.parse_args()
 
     cfg = tdconfig.load(args.config)
     tdlist = agaid.load_tdlist(cfg.tdlist)
-    rows = read_csv_rows(args.csv) if args.csv else read_sheet_rows(cfg, args.sheet, args.tab)
-    people = registrants(rows)
-    print(f"{len(people)} registrants · rating list {cfg.tdlist} ({len(tdlist)} members)")
 
-    needs_look = 0
+    # `signin --round N` reads the tournament file, so it needs no registration
+    # list.  Everything else does.
+    from_opengotha = args.what == "signin" and args.round
+    if not (args.csv or args.sheet or from_opengotha):
+        ap.error("need --csv or --sheet (or, for signin, --round N)")
+    people = []
+    if args.csv or args.sheet:
+        rows = read_csv_rows(args.csv) if args.csv else read_sheet_rows(cfg, args.sheet, args.tab)
+        people = registrants(rows)
+        print(f"{len(people)} registrants · rating list {cfg.tdlist} ({len(tdlist)} members)")
+
+    if args.what == "signin":
+        return build_signin(cfg, people, tdlist, args)
+
     if args.what in ("check", "ids"):
-        needs_look += audit_ids(people, tdlist, load_acks(acks_path(cfg, args.acks)),
-                                show_ok=args.show_ok)
+        audit_ids(people, tdlist, load_acks(acks_path(cfg, args.acks)),
+                  show_ok=args.show_ok)
     if args.what in ("check", "ranks"):
-        needs_look += audit_ranks(people, tdlist)
+        audit_ranks(people, tdlist)
+    if args.what in ("check", "ogs"):
+        audit_ogs(people, tdlist, cfg.ogs_cache, refresh=args.refresh)
     return 0
 
 

@@ -66,20 +66,30 @@ to understand before you touch it:
 
 Run it again as registrations arrive; it is cheap and idempotent.
 
+`go-roster signin` prints the check-in sheet.  If a TD asks why it is paper when
+they take everything else electronically: it is not a claim that electronic
+check-in is worse, it is the voter-verifiable-paper-trail argument — a sheet with
+a player's own initials survives a dead laptop and an edited spreadsheet.  Offer
+it, do not insist on it, and never assume how their results reach them.
+
+`go-roster ogs` needs an OGS handle column and is optional.  Its real value is on
+registrants with no AGA rating; for everyone else it is a curiosity, and the AGA
+rating stands regardless.
+
 ## Running an event
 
 Pair the round in OpenGotha → **File > Save** → `og-pairings --deploy` → enter
-result slips → `og-stale` → redeploy whatever it flags.
+enter the results → `og-stale` → redeploy whatever it flags.
 
 The single most important thing to tell a TD: **the tools read the file on disk,
 not OpenGotha's memory.**  If they did not save, the page shows the previous
 state and nothing warns them.  And every published page is a snapshot taken at
 deploy time, so results entered afterwards are invisible until someone re-runs
 the publisher — which is what `og-stale` exists to catch.  Run it after every
-batch of slips; it exits 1 and prints the exact redeploy command.
+batch of results; it exits 1 and prints the exact redeploy command.
 
-Mid-tournament, a TD is busy and focused - deep in pairings, slips and the next
-round.  Prefer running the command and reporting the result over handing them a
+Mid-tournament, a TD is busy and focused - deep in pairings, results and the
+next round.  Prefer running the command and reporting the result over handing them a
 command to type.
 
 ## If you are changing the code

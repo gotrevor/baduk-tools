@@ -134,3 +134,25 @@ def test_sheet_without_a_reader_names_the_way_out(setup):
                        capture_output=True, text=True)
     assert r.returncode != 0
     assert "--csv" in (r.stdout + r.stderr)
+
+
+def test_an_ogs_column_is_optional(setup):
+    """The registration list in this fixture has no OGS column at all."""
+    r = run(*setup, "ogs")
+    assert r.returncode == 0, r.stderr
+    assert "no OGS column" in r.stdout
+
+
+def test_an_ogs_header_is_not_mistaken_for_the_player_name(tmp_path, setup):
+    """'OGS username' contains neither 'name' nor 'aga' by accident - it contains
+    'name'.  Matching OGS first is what stops it claiming the name column."""
+    cfg, _ = setup
+    regs = tmp_path / "with-ogs.csv"
+    regs.write_text("Your name,AGA ID,Rank,OGS username\n"
+                    "Rowan Aldergate,90001,5d,rowanplaysgo\n")
+    from conftest import load_tool
+    gr = load_tool("go-roster")
+    rows = gr.read_csv_rows(regs)
+    col = gr.find_columns(rows[0])
+    assert col["name"] == 0 and col["ogs"] == 3
+    assert gr.registrants(rows)[0]["ogs"] == "rowanplaysgo"

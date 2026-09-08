@@ -140,6 +140,12 @@ class Config:
             rel.append(str(p.relative_to(self.site_repo)) if p.is_absolute() else str(p))
         return subprocess.run(cmd + rel, cwd=self.site_repo).returncode
 
+    @property
+    def ogs_cache(self):
+        """Where OGS lookups are cached; beside the config unless told otherwise."""
+        named = self.roster.get("ogs_cache")
+        return Path(named).expanduser() if named else self.source.parent / "ogs-cache.json"
+
     # --- the AGA rating list --------------------------------------------------
     @property
     def tdlist(self) -> Path:
